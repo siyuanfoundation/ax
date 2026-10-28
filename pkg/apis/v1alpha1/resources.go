@@ -34,9 +34,19 @@ import (
 // MaxCPULimitCores is the exclusive upper bound Substrate places on a cpu limit.
 const MaxCPULimitCores = 1000
 
+const (
+	// DefaultCPULimit is the default CPU limit applied when a task omits
+	// spec.resources.limits.cpu and no override is configured on ax-server.
+	DefaultCPULimit = "1000m"
+	// DefaultMemoryLimit is the default memory limit applied when a task omits
+	// spec.resources.limits.memory and no override is configured on ax-server.
+	DefaultMemoryLimit = "512Mi"
+)
+
 // ValidateResources reports the first problem with a task's resource
-// requirements. A nil or empty value is valid: the sandbox is then sized by its
-// worker's defaults.
+// requirements. A nil or empty value is valid: omitted cpu and memory limits
+// default to DefaultCPULimit (1000m) and DefaultMemoryLimit (512Mi) (or the
+// defaults configured on ax-server) when the ActorTemplate is built.
 func ValidateResources(reqs *ResourcesSpec) error {
 	if req := reqs.GetRequests(); req.GetCpu() != "" || req.GetMemory() != "" {
 		return errors.New("spec.resources.requests: not supported, only spec.resources.limits is applied to the sandbox")

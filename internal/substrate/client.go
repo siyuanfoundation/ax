@@ -290,14 +290,23 @@ func retryOnCodes(ctx context.Context, fn func() error, retryable ...codes.Code)
 	return err
 }
 
-const (
-	// DefaultCPUMillicores is the default CPU limit (1 core) applied to an
-	// ActorTemplate when a Task omits spec.resources.limits.cpu.
-	DefaultCPUMillicores int64 = 1000
-	// DefaultMemoryBytes is the default memory limit (512 MiB) applied to an
-	// ActorTemplate when a Task omits spec.resources.limits.memory.
-	DefaultMemoryBytes int64 = 512 << 20
+var (
+	// DefaultCPUMillicores is the default CPU limit in millicores, derived from
+	// v1alpha1.DefaultCPULimit, applied to an ActorTemplate when a Task omits
+	// spec.resources.limits.cpu.
+	DefaultCPUMillicores = mustParseQuantity(v1alpha1.ParseCPUMillicores(v1alpha1.DefaultCPULimit))
+	// DefaultMemoryBytes is the default memory limit in bytes, derived from
+	// v1alpha1.DefaultMemoryLimit, applied to an ActorTemplate when a Task omits
+	// spec.resources.limits.memory.
+	DefaultMemoryBytes = mustParseQuantity(v1alpha1.ParseMemoryBytes(v1alpha1.DefaultMemoryLimit))
 )
+
+func mustParseQuantity(v int64, err error) int64 {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
 
 // ResourceLimits translates a Task's resource limits into the Substrate
 // ActorTemplate resources block. Substrate sizes a sandbox by limits alone

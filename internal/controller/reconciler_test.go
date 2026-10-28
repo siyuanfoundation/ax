@@ -237,7 +237,7 @@ func TestTaskReconciler(t *testing.T) {
 	defer client.Close()
 
 	// 3. Reconcile Task
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "", "", "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -316,7 +316,7 @@ func TestTaskReconciler_DefaultTaskImage(t *testing.T) {
 			}
 			defer client.Close()
 
-			reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, tc.override)
+			reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, tc.override, "", "")
 			reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 			task := &v1alpha1.Task{
@@ -361,7 +361,7 @@ func TestTaskReconciler_Suspend(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "", "", "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -415,7 +415,7 @@ func TestTaskReconciler_SuspendError(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "", "", "")
 
 	workerIp := "10.1.1.1"
 	task := &v1alpha1.Task{
@@ -473,7 +473,7 @@ func TestTaskReconciler_TemplateCreationFailed(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "", "", "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -550,7 +550,7 @@ func TestTaskReconciler_TemplateCreationTransient(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "", "", "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -622,7 +622,7 @@ func TestTaskReconciler_WorkspaceReady(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "", "", "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -711,7 +711,7 @@ func TestTaskReconciler_ResourceLimits(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "", "", "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	task := &v1alpha1.Task{
@@ -778,6 +778,26 @@ func TestTaskReconciler_ResourceLimits(t *testing.T) {
 	if got := mockSrv.createdTemplates[len(mockSrv.createdTemplates)-1].GetResources(); !proto.Equal(got, wantDefault) {
 		t.Errorf("template for task without limits has resources %v, want %v", got, wantDefault)
 	}
+
+	// Custom default resource limits on the reconciler apply to omitted dimensions.
+	customReconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "", "4", "2Gi")
+	customReconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
+	customDefaultTask := &v1alpha1.Task{
+		ApiVersion: v1alpha1.APIVersion,
+		Kind:       v1alpha1.KindTask,
+		Metadata:   &v1alpha1.ObjectMeta{Name: "custom-default-task", Atespace: "default"},
+		Spec:       &v1alpha1.TaskSpec{Image: "ghrc.io/my-org/my-image"},
+	}
+	if _, err := customReconciler.Reconcile(ctx, customDefaultTask, nil); err != nil {
+		t.Fatalf("Reconcile with custom default limits failed: %v", err)
+	}
+	wantCustomDefault := &ateapipb.ResourceRequirements{Limits: &ateapipb.Resources{
+		CpuMillicores: 4000,
+		MemoryBytes:   2 << 30,
+	}}
+	if got := mockSrv.createdTemplates[len(mockSrv.createdTemplates)-1].GetResources(); !proto.Equal(got, wantCustomDefault) {
+		t.Errorf("template with custom default limits has resources %v, want %v", got, wantCustomDefault)
+	}
 }
 
 // A task that asks for limits must never run without them: invalid limits and a
@@ -811,7 +831,7 @@ func TestTaskReconciler_ResourceLimitsFailurePaths(t *testing.T) {
 			grpcServer.Stop()
 			lis.Close()
 		})
-		reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "")
+		reconciler := controller.NewTaskReconciler(client, "test-template", "ax-system", "", "", "")
 		reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 		return reconciler
 	}
@@ -928,7 +948,7 @@ func TestReconcileDelete_RemovesActorAndTemplates(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "", "", "")
 	reconciler.WorkspaceReadyTimeout = 200 * time.Millisecond
 
 	if err := reconciler.ReconcileDelete(ctx, "default", "job"); err != nil {
@@ -990,7 +1010,7 @@ func TestReconcileDelete_BlocksUntilActorDeleted(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "", "", "")
 
 	if err := reconciler.ReconcileDelete(ctx, "default", "slow-delete-task"); err != nil {
 		t.Fatalf("ReconcileDelete failed: %v", err)
@@ -1031,7 +1051,7 @@ func TestReconcileDelete_ActorDeletionTimeout(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "", "", "")
 
 	err = reconciler.ReconcileDelete(ctx, "default", "stuck-task")
 	if err == nil {
@@ -1094,7 +1114,7 @@ func TestTaskReconciler_TransientSubstrateUnavailable(t *testing.T) {
 	}
 	defer client.Close()
 
-	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "")
+	reconciler := controller.NewTaskReconciler(client, "test-template", v1alpha1.DefaultSystemNamespace, "", "", "")
 	reconciler.WorkspaceReadyTimeout = 50 * time.Millisecond
 
 	// 1. Transient error during EnsureAtespace leaves Task in Phase="Pending" with Reason="SubstrateUnavailable".

@@ -62,6 +62,10 @@ type TaskReconciler struct {
 	defaultTemplateAtespace string
 	// defaultTaskImage is applied to spec.image for tasks that leave it empty.
 	defaultTaskImage string
+	// defaultCPULimit and defaultMemoryLimit are applied to
+	// spec.resources.limits for tasks that leave them empty.
+	defaultCPULimit    string
+	defaultMemoryLimit string
 
 	// WorkspaceReadyTimeout bounds how long Reconcile waits for the actor's workspace
 	// to report ready before recording it as still initializing.
@@ -69,9 +73,10 @@ type TaskReconciler struct {
 }
 
 // NewTaskReconciler creates a new TaskReconciler. Empty defaults fall back to
-// "default-template", v1alpha1.DefaultSystemNamespace and
-// v1alpha1.DefaultTaskImage respectively.
-func NewTaskReconciler(client *substrate.Client, defaultTemplate, defaultTemplateAtespace, defaultTaskImage string) *TaskReconciler {
+// "default-template", v1alpha1.DefaultSystemNamespace,
+// v1alpha1.DefaultTaskImage, v1alpha1.DefaultCPULimit, and
+// v1alpha1.DefaultMemoryLimit respectively.
+func NewTaskReconciler(client *substrate.Client, defaultTemplate, defaultTemplateAtespace, defaultTaskImage, defaultCPULimit, defaultMemoryLimit string) *TaskReconciler {
 	if defaultTemplate == "" {
 		defaultTemplate = "default-template"
 	}
@@ -81,12 +86,20 @@ func NewTaskReconciler(client *substrate.Client, defaultTemplate, defaultTemplat
 	if defaultTaskImage == "" {
 		defaultTaskImage = v1alpha1.DefaultTaskImage
 	}
+	if defaultCPULimit == "" {
+		defaultCPULimit = v1alpha1.DefaultCPULimit
+	}
+	if defaultMemoryLimit == "" {
+		defaultMemoryLimit = v1alpha1.DefaultMemoryLimit
+	}
 	return &TaskReconciler{
 		client:                  client,
 		httpClient:              newProbeHTTPClient(),
 		defaultTemplate:         defaultTemplate,
 		defaultTemplateAtespace: defaultTemplateAtespace,
 		defaultTaskImage:        defaultTaskImage,
+		defaultCPULimit:         defaultCPULimit,
+		defaultMemoryLimit:      defaultMemoryLimit,
 		WorkspaceReadyTimeout:   defaultWorkspaceReadyTimeout,
 	}
 }
@@ -136,6 +149,18 @@ func (r *TaskReconciler) Reconcile(ctx context.Context, task *v1alpha1.Task, ws 
 	}
 	if task.Spec.Image == "" {
 		task.Spec.Image = r.defaultTaskImage
+	}
+	if task.Spec.Resources == nil {
+		task.Spec.Resources = &v1alpha1.ResourcesSpec{}
+	}
+	if task.Spec.Resources.Limits == nil {
+		task.Spec.Resources.Limits = &v1alpha1.ResourceList{}
+	}
+	if task.Spec.Resources.Limits.Cpu == "" {
+		task.Spec.Resources.Limits.Cpu = r.defaultCPULimit
+	}
+	if task.Spec.Resources.Limits.Memory == "" {
+		task.Spec.Resources.Limits.Memory = r.defaultMemoryLimit
 	}
 
 	slog.Info("reconciling task", "name", task.Metadata.Name, "atespace", atespace, "image", task.Spec.Image)

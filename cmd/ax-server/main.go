@@ -48,6 +48,8 @@ func main() {
 		defaultTemplate         string
 		defaultTemplateAtespace string
 		defaultTaskImage        string
+		defaultCPULimit         string
+		defaultMemoryLimit      string
 	)
 
 	flag.StringVar(&listenAddr, "addr", ":8080", "HTTP listen address")
@@ -61,6 +63,8 @@ func main() {
 	flag.StringVar(&defaultTemplate, "template", "default-template", "Default Substrate ActorTemplate name")
 	flag.StringVar(&defaultTemplateAtespace, "template-atespace", v1alpha1.DefaultSystemNamespace, "Default Substrate ActorTemplate atespace")
 	flag.StringVar(&defaultTaskImage, "default-task-image", v1alpha1.DefaultTaskImage, "Container image for tasks that do not set spec.image (env: AX_DEFAULT_TASK_IMAGE)")
+	flag.StringVar(&defaultCPULimit, "default-cpu-limit", v1alpha1.DefaultCPULimit, `CPU limit for tasks that do not set spec.resources.limits.cpu (e.g. "500m", "2")`)
+	flag.StringVar(&defaultMemoryLimit, "default-memory-limit", v1alpha1.DefaultMemoryLimit, `Memory limit for tasks that do not set spec.resources.limits.memory (e.g. "512Mi", "4Gi")`)
 	flag.Parse()
 
 	if envAddr := os.Getenv("ADDR"); envAddr != "" {
@@ -79,12 +83,23 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
+	if _, err := v1alpha1.ParseCPUMillicores(defaultCPULimit); err != nil {
+		slog.Error("invalid --default-cpu-limit", "value", defaultCPULimit, "error", err)
+		os.Exit(1)
+	}
+	if _, err := v1alpha1.ParseMemoryBytes(defaultMemoryLimit); err != nil {
+		slog.Error("invalid --default-memory-limit", "value", defaultMemoryLimit, "error", err)
+		os.Exit(1)
+	}
+
 	slog.Info("starting ax-server",
 		"listenAddr", listenAddr,
 		"store", describeStore(storeURL),
 		"substrateEndpoint", substrateEndpoint,
 		"template", defaultTemplate,
 		"defaultTaskImage", defaultTaskImage,
+		"defaultCPULimit", defaultCPULimit,
+		"defaultMemoryLimit", defaultMemoryLimit,
 	)
 
 	openCtx, openCancel := context.WithTimeout(context.Background(), time.Minute)
@@ -109,7 +124,7 @@ func main() {
 		slog.Warn("could not initialize substrate client; running without substrate reconciliation", "error", err)
 	} else {
 		defer subClient.Close()
-		reconciler = controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace, defaultTaskImage)
+		reconciler = controller.NewTaskReconciler(subClient, defaultTemplate, defaultTemplateAtespace, defaultTaskImage, defaultCPULimit, defaultMemoryLimit)
 	}
 
 	srv := server.NewServer(backend, server.Options{
