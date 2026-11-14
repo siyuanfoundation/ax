@@ -1,0 +1,268 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package ax.runner.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "pkg/apis/v1alpha1/task.proto";
+import "pkg/apis/v1alpha1/workspace.proto";
+
+option go_package = "github.com/google/ax/pkg/apis/runner/v1;runnerv1";
+
+// AssignmentMode tells ax-task-runner what to execute on boot or wakeup.
+enum AssignmentMode {
+  ASSIGNMENT_MODE_UNSPECIFIED = 0;
+  // Kill any leftover task-uid processes and sit idle serving /readyz until
+  // parked or woken again.
+  ASSIGNMENT_MODE_IDLE = 1;
+  // Kill leftover task-uid processes, clear /workspace/.ax/output*, write
+  // goal.md & config.json, persist (actor_uid, run_id) in /var/lib/ax/state.json,
+  // wait start_delay, and spawn exec.
+  ASSIGNMENT_MODE_RUN = 2;
+  // Continue supervising the live in_memory_run_id process across a MEMORY
+  // snapshot restore.
+  ASSIGNMENT_MODE_RESUME = 3;
+  reserved 4; // Reserved for deferred platform verifier execution.
+  // Execute Workspace.spec.setup (git, files, skills, commands), report
+  // setup_finished, and wait for the next step or snapshot checkpoint.
+  ASSIGNMENT_MODE_SETUP = 5;
+}
+
+// ClaimAssignmentRequest is sent by ax-task-runner on initial startup and on
+// every wakeup probe.
+//
+// On wakeup, if the runner still holds unacknowledged events in memory, it must
+// send them via ReportEventsRequest before calling ClaimAssignment. Claiming an
+// assignment can start a new execution and discard unacknowledged events; if a
+// pending command_exited were discarded first, ax-server would re-run a command
+// that already finished.
+message ClaimAssignmentRequest {
+  // Active run ID held in PID 1 memory; empty on cold boot.
+  string in_memory_run_id = 1;
+  // Last started run ID persisted in /var/lib/ax/state.json for the current
+  // actor_uid; rewound when RevertActor rolls storage back, and ignored when
+  // /run/ate's actor_uid differs from the persisted actor_uid.
+  string last_started_run_id = 2;
+  // True when the in_memory_run_id child process is still alive.
+  bool child_alive = 3;
+  // Per-wakeup random nonce making claim retries idempotent if the HTTP
+  // response is lost after commit.
+  string nonce = 4;
+}
+
+// ClaimAssignmentResponse describes the assignment returned by ax-server.
+message ClaimAssignmentResponse {
+  AssignmentMode mode = 1;
+  string run_id = 2;
+  int32 attempt = 3;
+  // Populated only when ax-server mints (or re-mints on an unstarted initial
+  // nonce retry) the per-actor runner token.
+  string runner_token = 4;
+  // Task resource served read-only on loopback /metadata/v1alpha1/ax/task.
+  // Omitted for temporary workspace setup actors that are not Tasks.
+  ax.v1alpha1.Task task = 5;
+  // Bound Workspace (including dynamically resolved spec.mcp) served on
+  // loopback /metadata/v1alpha1/ax/workspace.
+  ax.v1alpha1.Workspace workspace = 6;
+  // Command execution specification; populated when mode is ASSIGNMENT_MODE_RUN.
+  ExecSpec exec = 7;
+  // Goal context written to /workspace/.ax/goal.md and served on loopback
+  // /metadata/v1alpha1/ax/goal.
+  GoalPayload goal = 8;
+  reserved 9, 10; // Reserved for deferred verifiers and control-plane turns.
+  // Retry backoff to sleep before spawning exec (0 = start immediately).
+  google.protobuf.Duration start_delay = 11;
+}
+
+// ExecSpec configures the supervised child command for ASSIGNMENT_MODE_RUN.
+message ExecSpec {
+  // Effective command argv (from task.status.resolved_argv).
+  repeated string argv = 1;
+  // Effective working directory (from task.spec.WorkspacePath()).
+  string workdir = 2;
+  // Merged environment variables (task.spec.env + AX_* metadata/file paths and
+  // gateway CA bundle variables).
+  map<string, string> env = 3;
+  // Non-root UID to drop the child process to (defaults to 1000).
+  int32 run_as_uid = 4;
+}
+
+// GoalPayload carries the task's natural-language goal and prior retry failure.
+message GoalPayload {
+  // Natural-language goal from task.spec.goal.spec.
+  string spec = 1;
+  // Summary of the previous attempt's failure (from task.status.previous_failure);
+  // empty on attempt 1.
+  string previous_failure = 2;
+}
+
+// ReportEventsRequest delivers ordered lifecycle events and heartbeats from
+// ax-task-runner to ax-server.
+message ReportEventsRequest {
+  // Identifier of the run currently executing on the runner (from its active
+  // ASSIGNMENT_MODE_RUN assignment). This field is empty when no run is active,
+  // such as during workspace setup or after an ASSIGNMENT_MODE_IDLE assignment.
+  // A runner that emitted idle_notice after its command became idle is still in
+  // that run and continues sending its run_id.
+  //
+  // ax-server ignores sequenced events whose run_id does not match the task's
+  // active run, preventing delayed events from an earlier run from affecting a
+  // later one.
+  //
+  // TODO: Add a server-issued execution_id to ClaimAssignmentResponse and
+  // ReportEventsRequest so executions that share an empty run_id (such as
+  // back-to-back setup passes or the window between a failed run and its retry)
+  // are also uniquely fenced. Today, a delayed duplicate event across two
+  // empty-run_id executions can trigger an extra checkpoint/setup pass or start
+  // a retry before RevertActor runs, though it cannot corrupt terminal task
+  // state. Adding execution_id on both messages is wire-compatible for existing
+  // peers.
+  string run_id = 1;
+  // Unacknowledged sequenced events in ascending seq order (see RunnerEvent.seq),
+  // optionally interleaved with unsequenced heartbeats. Because the runner
+  // resends unacknowledged events until ack_seq advances past them, a request
+  // may repeat events sent in an earlier request.
+  repeated RunnerEvent events = 2;
+}
+
+// RunnerEvent is a single sequenced event emitted by ax-task-runner.
+message RunnerEvent {
+  // 1-based sequence number of this event within the current execution.
+  //
+  // An execution is a single ASSIGNMENT_MODE_SETUP pass or a single
+  // ASSIGNMENT_MODE_RUN invocation. Every SETUP or RUN assignment starts a new
+  // execution, whether delivered by ClaimAssignment or in
+  // ReportEventsResponse.next. ASSIGNMENT_MODE_RESUME and ASSIGNMENT_MODE_IDLE
+  // do not start a new execution.
+  //
+  // Runner numbering rules:
+  //   - The runner maintains a per-execution counter starting at 1 and
+  //     increments it by 1 for each sequenced event.
+  //   - Starting a new execution (SETUP or RUN) discards any unacknowledged
+  //     events from the previous execution and resets the counter so the next
+  //     event has seq = 1. This reset applies even if ax-server re-issues the
+  //     same run_id (which happens only when ax-server never applied an event
+  //     for that run, e.g. when the sandbox was suspended before the command
+  //     started).
+  //   - Receiving RESUME or IDLE preserves both the counter and any
+  //     unacknowledged events.
+  //   - Before receiving its first SETUP or RUN assignment, a freshly booted
+  //     runner has no active execution and sends only heartbeats.
+  //
+  // Server deduplication rules:
+  //   - ax-server tracks the highest seq applied in the current execution. It
+  //     applies events with seq greater than that watermark, ignores events at
+  //     or below it as duplicates, and rejects sequenced events with seq < 1
+  //     with HTTP 400.
+  //
+  // Special cases:
+  //   - heartbeat is unsequenced: it mutates no lifecycle state, always carries
+  //     seq = 0, and is not tracked by ack_seq.
+  //   - eviction_notice describes the host worker rather than the command, but
+  //     still uses the current execution's seq counter. If a new execution
+  //     starts while the worker is still draining, the runner emits a fresh
+  //     eviction_notice in the new execution even if an earlier one was
+  //     acknowledged.
+  int64 seq = 1;
+  google.protobuf.Timestamp time = 2;
+  oneof event {
+    SetupFinished setup_finished = 3;
+    CommandStarted command_started = 4;
+    CommandExited command_exited = 5;
+    EvictionNotice eviction_notice = 7;
+    IdleNotice idle_notice = 8;
+    Heartbeat heartbeat = 9;
+  }
+  reserved 6, 10; // Reserved for deferred verifier_finished and suspend_request.
+}
+
+message SetupFinished {
+  bool ok = 1;
+  string message = 2;
+}
+
+message CommandStarted {
+  int32 pid = 1;
+}
+
+message CommandExited {
+  int32 exit_code = 1;
+  string signal = 2;
+  // Unstructured output from $AX_OUTPUT_FILE or 64 KiB stdout/stderr tail.
+  string output = 3;
+  // Optional structured JSON output from $AX_OUTPUT_JSON_FILE or loopback POST.
+  google.protobuf.Struct structured_output = 4;
+  ExitCause cause = 5;
+}
+
+enum ExitCause {
+  EXIT_CAUSE_UNSPECIFIED = 0;
+  EXIT_CAUSE_EXITED = 1;
+  EXIT_CAUSE_SIGNALED = 2;
+  EXIT_CAUSE_OOM_KILLED = 3;
+  EXIT_CAUSE_DISK_FULL = 4;
+}
+
+// EvictionNotice tells ax-server that the worker hosting the sandbox is being
+// drained, so the task should be checkpointed and resumed on another worker.
+// The runner sends a fresh notice if a new execution starts before the drain
+// completes (see RunnerEvent.seq).
+message EvictionNotice {
+  google.protobuf.Timestamp deadline = 1;
+}
+
+message IdleNotice {
+  // Seconds of inactivity observed before parking (0 when explicitly requested
+  // via POST /metadata/v1alpha1/ax/idle).
+  int64 idle_seconds = 1;
+  string output = 2;
+  google.protobuf.Struct structured_output = 3;
+}
+
+message Heartbeat {}
+
+message ReportEventsResponse {
+  // Highest RunnerEvent.seq that ax-server has applied in the current
+  // execution. Every event with seq <= ack_seq is acknowledged and must not be
+  // sent again.
+  //
+  // When next carries ASSIGNMENT_MODE_RUN, a new execution has begun: ack_seq
+  // is 0 for that new execution, and the runner discards any unacknowledged
+  // events from the finished execution.
+  //
+  // If ack_seq is below the highest seq in the request and next is unset,
+  // ax-server ignored the remaining events (typically because their run_id is
+  // no longer active). Instead of resending those stale events indefinitely,
+  // the runner calls ClaimAssignment to resynchronize with ax-server.
+  int64 ack_seq = 1;
+  // Optional next assignment piggybacked on the response to avoid an extra
+  // ClaimAssignment round-trip. ax-server sets next to ASSIGNMENT_MODE_IDLE
+  // when there is nothing to run immediately (setup finished, the task reached
+  // a terminal state, or a retry is waiting for a checkpoint), or to
+  // ASSIGNMENT_MODE_RUN (with start_delay) for an in-place retry, which starts
+  // a new execution (see RunnerEvent.seq).
+  //
+  // If the runner reported command_exited and receives a response with next
+  // unset (for example when resending after a lost HTTP response), it has
+  // nothing left to execute and must call ClaimAssignment to fetch its current
+  // assignment.
+  //
+  // When next is ASSIGNMENT_MODE_RUN and next.workspace is omitted,
+  // ax-task-runner retains its previously claimed Workspace metadata.
+  ClaimAssignmentResponse next = 2;
+}

@@ -189,3 +189,23 @@ func TestValidateTask(t *testing.T) {
 		})
 	}
 }
+
+// Each task's Substrate actor shares the task's name, and the :8081 runner
+// server routes actors with the ax-ws-setup- prefix to the workspace setup
+// handler rather than the tasks table.
+func TestValidateTaskRejectsReservedSetupActorPrefix(t *testing.T) {
+	for name, wantErr := range map[string]bool{
+		"ax-ws-setup-payments": true,
+		"ax-ws-setup-":         false, // not an RFC 1123 label; rejected by ValidateName instead
+		"ax-ws-setup":          false,
+		"ax-ws-setups":         false,
+		"my-ax-ws-setup-task":  false,
+		"fix-refund-bug":       false,
+	} {
+		err := apivalidation.ValidateTask(&v1alpha1.Task{Metadata: &v1alpha1.ObjectMeta{Name: name}})
+		reserved := err != nil && strings.Contains(err.Error(), "reserved for workspace setup actors")
+		if reserved != wantErr {
+			t.Errorf("ValidateTask(name=%q) = %v, reserved-prefix rejection = %v, want %v", name, err, reserved, wantErr)
+		}
+	}
+}

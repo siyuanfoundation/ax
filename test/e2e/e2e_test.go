@@ -21,6 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/ax/internal/controller"
+	"github.com/google/ax/internal/substrate"
+	runnerv1 "github.com/google/ax/pkg/apis/runner/v1"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc/codes"
@@ -728,5 +731,160 @@ func TestE2E_GatewayEgress(t *testing.T) {
 		env.mustRunAX(t, ns, "suspend", "task", bound)
 		env.mustRunAX(t, ns, "resume", "task", bound)
 		assertContains(t, "request received after the gateway was "+change, received(), "Bearer e2e-token")
+	}
+}
+
+// TestE2E_RuntimeClientAndWarmWorkspaceSnapshotTag exercises the RuntimeClient,
+// shared Profile ActorTemplate, and warm Workspace snapshot Tag lifecycle end
+// to end on Agent Substrate:
+//   - Shared content-addressed Profile ActorTemplate (ax-<sha256[:16]>,
+//     SNAPSHOT_FIDELITY_ROOTFS) via ResolveProfileTemplateWithDefaults.
+//   - Temporary workspace setup actor (ax-ws-setup-*) checkpointed with
+//     SuspendActorSync (DURABILITY_MODE_SYNCHRONOUS + ActiveSnapshotGeneration),
+//     tagged via WorkspaceTagName + CreateTag, and deleted while its Tag persists.
+//   - Downstream actors seeded from that warm Tag via EnsureActorFromTag,
+//     paged via ListActorsPage, and reverted via idempotent RevertActor.
+//   - AX Task creation/deletion in the same atespace merges Postgres generation
+//     and leaves the shared Profile ActorTemplate intact.
+func TestE2E_RuntimeClientAndWarmWorkspaceSnapshotTag(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Minute)
+	defer cancel()
+
+	var rc substrate.RuntimeClient = env.SubstrateClient
+	ns := uniqueName("warm-tag")
+	if err := rc.EnsureAtespace(ctx, ns); err != nil {
+		t.Fatalf("EnsureAtespace(%s): %v", ns, err)
+	}
+
+	defaultImgRaw, err := env.kubectl("-n", env.AXSystemNamespace, "get", "deployment/ax-server",
+		"-o", "jsonpath={.spec.template.spec.containers[0].env[?(@.name=='AX_DEFAULT_TASK_IMAGE')].value}")
+	if err != nil || strings.TrimSpace(defaultImgRaw) == "" {
+		t.Fatalf("reading AX_DEFAULT_TASK_IMAGE from deployment/ax-server: %v (%q)", err, defaultImgRaw)
+	}
+	defaultImage := strings.TrimSpace(defaultImgRaw)
+
+	// 1. Provision shared content-addressed Profile ActorTemplate (ROOTFS fidelity).
+	tmplName, tmplSpec, err := controller.ResolveProfileTemplateWithDefaults(ns, &v1alpha1.Profile{}, defaultImage, "")
+	if err != nil {
+		t.Fatalf("ResolveProfileTemplateWithDefaults: %v", err)
+	}
+	if _, err := rc.EnsureActorTemplate(ctx, tmplSpec); err != nil {
+		t.Fatalf("EnsureActorTemplate(%s): %v", tmplName, err)
+	}
+	t.Cleanup(func() {
+		_ = env.SubstrateClient.DeleteActorTemplate(context.Background(), ns, tmplName)
+	})
+
+	// 2. Provision a temporary workspace setup actor: boot, synchronous checkpoint, tag, delete setup actor.
+	setupActorName := uniqueName(runnerv1.SetupActorPrefix + "ws")
+	if !runnerv1.IsSetupActorName(setupActorName) {
+		t.Fatalf("expected %q to match IsSetupActorName", setupActorName)
+	}
+	setupActor, err := rc.EnsureActorFromTag(ctx, ns, setupActorName, ns, tmplName, "")
+	if err != nil || setupActor.GetMetadata().GetUid() == "" {
+		t.Fatalf("EnsureActorFromTag(setup): actor=%v, err=%v", setupActor, err)
+	}
+	t.Cleanup(func() {
+		_ = rc.DeleteActor(context.Background(), ns, setupActorName)
+	})
+
+	if _, _, err := rc.ResumeActor(ctx, ns, setupActorName); err != nil {
+		t.Fatalf("ResumeActor(setup): %v", err)
+	}
+	_, setupSnapGen, err := rc.SuspendActorSync(ctx, ns, setupActorName)
+	if err != nil {
+		t.Fatalf("SuspendActorSync(setup): %v", err)
+	}
+	if setupSnapGen < 1 {
+		t.Fatalf("SuspendActorSync(setup) snapshot generation = %d, want >= 1", setupSnapGen)
+	}
+
+	tagName := controller.WorkspaceTagName("payments-ws", tmplName, 1)
+	if _, err := rc.CreateTag(ctx, ns, tagName, setupActorName); err != nil {
+		t.Fatalf("CreateTag(%s): %v", tagName, err)
+	}
+	t.Cleanup(func() {
+		_ = rc.DeleteTag(context.Background(), ns, tagName)
+	})
+
+	if err := poll(60*time.Second, 500*time.Millisecond, func() error {
+		tag, getErr := rc.GetTag(ctx, ns, tagName)
+		if getErr != nil {
+			return getErr
+		}
+		st := tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetState()
+		if st != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			return fmt.Errorf("tag %s durable snapshot state = %v, want COMPLETED", tagName, st)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("waiting for Tag %s durability: %v", tagName, err)
+	}
+
+	// Deleting the temporary setup actor must leave the warm Tag usable.
+	if err := rc.DeleteActor(ctx, ns, setupActorName); err != nil {
+		t.Fatalf("DeleteActor(setup): %v", err)
+	}
+
+	// 3. Seed two actors from the warm Tag and verify ListActorsPage, SuspendActorSync,
+	// and idempotent RevertActor against real Substrate.
+	actorA := uniqueName("warm-a")
+	actorB := uniqueName("warm-b")
+	for _, a := range []string{actorA, actorB} {
+		created, createErr := rc.EnsureActorFromTag(ctx, ns, a, ns, tmplName, tagName)
+		if createErr != nil || created.GetMetadata().GetUid() == "" {
+			t.Fatalf("EnsureActorFromTag(%s from %s): actor=%v, err=%v", a, tagName, created, createErr)
+		}
+		name := a
+		t.Cleanup(func() {
+			_ = rc.DeleteActor(context.Background(), ns, name)
+		})
+	}
+
+	page1, nextTok, err := rc.ListActorsPage(ctx, ns, 1, "")
+	if err != nil || len(page1) != 1 || nextTok == "" {
+		t.Fatalf("ListActorsPage page 1 = (len=%d, next=%q, err=%v), want 1 actor + token", len(page1), nextTok, err)
+	}
+	page2, _, err := rc.ListActorsPage(ctx, ns, 10, nextTok)
+	if err != nil || len(page2) < 1 {
+		t.Fatalf("ListActorsPage page 2 = (len=%d, err=%v), want >= 1 actor", len(page2), err)
+	}
+
+	if _, _, err := rc.ResumeActor(ctx, ns, actorA); err != nil {
+		t.Fatalf("ResumeActor(%s): %v", actorA, err)
+	}
+	_, genAfterSync, err := rc.SuspendActorSync(ctx, ns, actorA)
+	if err != nil || genAfterSync < 1 {
+		t.Fatalf("SuspendActorSync(%s) = (gen=%d, err=%v), want >= 1", actorA, genAfterSync, err)
+	}
+	if _, _, err := rc.ResumeActor(ctx, ns, actorA); err != nil {
+		t.Fatalf("ResumeActor(%s) before revert: %v", actorA, err)
+	}
+	reverted, revGen, err := rc.RevertActor(ctx, ns, actorA)
+	if err != nil || reverted.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED || revGen != genAfterSync {
+		t.Fatalf("RevertActor(%s) = (state=%v, gen=%d, err=%v), want SUSPENDED at gen %d",
+			actorA, reverted.GetStatus().GetState(), revGen, err, genAfterSync)
+	}
+	// Repeat RevertActor on the already-SUSPENDED actor to verify queue-retry idempotency.
+	reverted2, revGen2, err := rc.RevertActor(ctx, ns, actorA)
+	if err != nil || reverted2.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED || revGen2 != genAfterSync {
+		t.Fatalf("second RevertActor(%s) = (state=%v, gen=%d, err=%v), want idempotent SUSPENDED at gen %d",
+			actorA, reverted2.GetStatus().GetState(), revGen2, err, genAfterSync)
+	}
+
+	// 4. Create & delete an AX Task in the same atespace: verify Postgres
+	// generation merge + live ActorUid on GetTask and that shared template survives DeleteTask.
+	taskName := uniqueName("task-gen")
+	env.deleteOnCleanup(t, ns, "task", taskName)
+	assertContains(t, "'ax apply' task", env.apply(t, ns, taskManifest(t, ns, taskName, false)), "task.ax.io/"+taskName+" created")
+
+	gotTask := env.getTask(t, ns, taskName)
+	if gotTask.GetStatus().GetGeneration() < 1 || gotTask.GetStatus().GetActorUid() == "" {
+		t.Fatalf("GetTask generation=%d actorUid=%q, want generation>=1 and non-empty actorUid",
+			gotTask.GetStatus().GetGeneration(), gotTask.GetStatus().GetActorUid())
+	}
+	env.mustRunAX(t, ns, "delete", "task", taskName)
+	if _, err := rc.GetActorTemplate(ctx, ns, tmplName); err != nil {
+		t.Fatalf("shared ActorTemplate %s should survive DeleteTask, got: %v", tmplName, err)
 	}
 }

@@ -105,6 +105,11 @@ const (
 // IsAXTaskState reports whether state describes the control plane's own stored
 // state on a task (queued for provisioning/retry, or terminal) rather than a
 // live state derived from the task's actor on Agent Substrate.
+//
+// Note: IsAXTaskState applies only to the legacy actor-derived TaskReconciler
+// path. Tasks managed through store.Apply persist authoritative TaskState
+// across all 9 states (including IDLE, WORKING, SUSPENDED, and SUSPENDING) and
+// only overlay live status.actor and status.actor_uid on read.
 func IsAXTaskState(state TaskState) bool {
 	switch state {
 	case TaskState_TASK_STATE_QUEUED,

@@ -20,6 +20,7 @@ import (
 	"math"
 	"strings"
 
+	runnerv1 "github.com/google/ax/pkg/apis/runner/v1"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -31,6 +32,11 @@ import (
 func ValidateTask(t *v1alpha1.Task) error {
 	if err := ValidateObjectMeta(t.GetMetadata()); err != nil {
 		return err
+	}
+	// Each task's Substrate actor shares the task's name, and the :8081 runner
+	// server routes setup actors by the ax-ws-setup- prefix.
+	if name := t.GetMetadata().GetName(); runnerv1.IsSetupActorName(name) {
+		return fmt.Errorf("metadata.name: invalid value %q: the %q prefix is reserved for workspace setup actors", name, runnerv1.SetupActorPrefix)
 	}
 	spec := t.GetSpec()
 	if err := validateProfile("spec.profile", spec.GetProfile()); err != nil {

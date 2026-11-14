@@ -24,11 +24,23 @@ import (
 
 var (
 	ErrNotFound = errors.New("resource not found")
+	// ErrLockTimeout is returned by Apply when acquiring the row lock or
+	// executing the short transaction exceeds its bounded timeout (2s lock,
+	// 5s statement). Callers treat it as retryable (HTTP 503 on :8081, gRPC
+	// Aborted/Unavailable on :8080).
+	ErrLockTimeout = errors.New("task row lock or statement timeout")
+	// ErrLeaseLost is returned when a queue worker attempts to commit an action
+	// result or renew a lease it no longer owns.
+	ErrLeaseLost = errors.New("task queue lease lost")
 )
 
 // TODO(jbd): Better pagination.
 
 // Store defines the storage interface for AX resources.
+//
+// For tasks managed via [TaskApplier] (store.Apply), the stored
+// TaskStatus.state (mirrored in tasks.state) is authoritative for all TaskState
+// values rather than being derived on read from live Substrate Actor calls.
 type Store interface {
 	SaveTask(ctx context.Context, task *v1alpha1.Task) error
 	GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error)
@@ -40,6 +52,7 @@ type Store interface {
 	SaveWorkspace(ctx context.Context, ws *v1alpha1.Workspace) error
 	GetWorkspace(ctx context.Context, atespace, name string) (*v1alpha1.Workspace, error)
 	ListWorkspaces(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Workspace, error)
+	UpdateWorkspaceStatus(ctx context.Context, atespace, name string, status *v1alpha1.WorkspaceStatus) error
 	DeleteWorkspace(ctx context.Context, atespace, name string) error
 
 	SaveGateway(ctx context.Context, gw *v1alpha1.Gateway) error
