@@ -19,10 +19,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/ax/internal/store"
+	"github.com/google/ax/internal/store/storetest"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -45,7 +49,7 @@ func openTest(t *testing.T, opts Options) *Store {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := s.pool.Exec(ctx, `TRUNCATE tasks, workspaces, gateways, models, locks`); err != nil {
+	if _, err := s.pool.Exec(ctx, `TRUNCATE tasks, workspaces, gateways, models, locks, ax_replicas, workspace_snapshots`); err != nil {
 		t.Fatalf("truncating tables: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
@@ -55,7 +59,7 @@ func openTest(t *testing.T, opts Options) *Store {
 func TestCreateSchemaConcurrent(t *testing.T) {
 	s := openTest(t, Options{})
 	ctx := context.Background()
-	if _, err := s.pool.Exec(ctx, `DROP TABLE tasks, workspaces, gateways, models, locks`); err != nil {
+	if _, err := s.pool.Exec(ctx, `DROP TABLE tasks, workspaces, gateways, models, locks, ax_replicas, workspace_snapshots`); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate several replicas starting at once.
@@ -250,4 +254,83 @@ func TestRestartKeepsTasksAndReleasesLocks(t *testing.T) {
 		t.Fatalf("Lock after restart: %v", err)
 	}
 	unlock()
+}
+
+func TestStoreContract(t *testing.T) {
+	s := openTest(t, Options{})
+	storetest.RunContract(t, s)
+}
+
+func TestApplyConcurrentCreateAndLockTimeout(t *testing.T) {
+	s := openTest(t, Options{})
+	ctx := context.Background()
+	key := store.TaskKey{Atespace: "default", Name: "race-create"}
+
+	// 1. Concurrent Apply calls when current == nil must all succeed without
+	// leaking 23505 unique_violation errors, serializing from generation 1..N.
+	const workers = 6
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for range workers {
+		wg.Go(func() {
+			_, err := s.Apply(ctx, key, func(cur *store.TaskRow, _ time.Time) (*store.TaskRow, error) {
+				if cur == nil {
+					return &store.TaskRow{
+						Task: &v1alpha1.Task{
+							Metadata: &v1alpha1.ObjectMeta{Atespace: key.Atespace, Name: key.Name},
+						},
+						RunSeq: 1,
+					}, nil
+				}
+				next := cur.Clone()
+				next.RunSeq++
+				return next, nil
+			})
+			errs <- err
+		})
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Apply failed: %v", err)
+		}
+	}
+	row, err := s.GetTaskRow(ctx, key)
+	if err != nil {
+		t.Fatalf("GetTaskRow: %v", err)
+	}
+	if row.Generation != workers || row.RunSeq != workers {
+		t.Fatalf("final row = (gen=%d, runSeq=%d), want (%d, %d)", row.Generation, row.RunSeq, workers, workers)
+	}
+
+	// 2. Holding FOR UPDATE longer than Apply's 2s lock_timeout returns store.ErrLockTimeout.
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	holdDone := make(chan error, 1)
+	go func() {
+		holdDone <- pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			var gen int64
+			if err := tx.QueryRow(ctx, `SELECT generation FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE`,
+				key.Atespace, key.Name).Scan(&gen); err != nil {
+				return err
+			}
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	<-locked
+	_, lockErr := s.Apply(ctx, key, func(cur *store.TaskRow, _ time.Time) (*store.TaskRow, error) {
+		next := cur.Clone()
+		next.RunSeq++
+		return next, nil
+	})
+	close(release)
+	if err := <-holdDone; err != nil {
+		t.Fatalf("holder tx: %v", err)
+	}
+	if !errors.Is(lockErr, store.ErrLockTimeout) {
+		t.Fatalf("Apply under lock contention = %v, want store.ErrLockTimeout", lockErr)
+	}
 }

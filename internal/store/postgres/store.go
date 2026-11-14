@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package postgres implements store.Store and lock.Locker on PostgreSQL.
+// Package postgres implements store.Store, store.TaskApplier,
+// store.WorkspaceSnapshotStore, and lock.Locker on PostgreSQL.
 //
 // Open takes a libpq-style connection URL; standard libpq environment
 // variables such as PGPASSWORD fill in what it leaves out.
@@ -51,17 +52,19 @@ type Options struct {
 	LockRetryInterval time.Duration
 }
 
-// Store is a PostgreSQL implementation of store.Store. It is also a
-// lock.Locker (see Lock) whose locks are shared by every ax-server replica
-// using the same database.
+// Store is a PostgreSQL implementation of store.Store, store.TaskApplier,
+// store.WorkspaceSnapshotStore, and lock.Locker.
 type Store struct {
-	pool *pgxpool.Pool
-	opts Options
+	pool  *pgxpool.Pool
+	opts  Options
+	dueCh chan struct{}
 }
 
 var (
-	_ store.Store = (*Store)(nil)
-	_ lock.Locker = (*Store)(nil)
+	_ store.Store                  = (*Store)(nil)
+	_ store.TaskApplier            = (*Store)(nil)
+	_ store.WorkspaceSnapshotStore = (*Store)(nil)
+	_ lock.Locker                  = (*Store)(nil)
 )
 
 // Open connects to the database at connURL and creates any missing tables.
@@ -89,13 +92,30 @@ func Open(ctx context.Context, connURL string, opts Options) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Store{pool: pool, opts: opts}, nil
+	return &Store{
+		pool:  pool,
+		opts:  opts,
+		dueCh: make(chan struct{}, 1),
+	}, nil
 }
 
 // Close closes all connections.
 func (s *Store) Close() error {
 	s.pool.Close()
 	return nil
+}
+
+// DueNotify returns a 1-buffered channel signaled whenever Apply commits a task
+// row that is immediately due without an active worker lease.
+func (s *Store) DueNotify() <-chan struct{} {
+	return s.dueCh
+}
+
+func (s *Store) notifyDue() {
+	select {
+	case s.dueCh <- struct{}{}:
+	default:
+	}
 }
 
 func defaultAtespace(atespace string) string {
@@ -201,8 +221,7 @@ func (s *Store) delete(ctx context.Context, t table, atespace, name string) erro
 
 // --- Tasks ---
 
-// SaveTask stores or replaces a task.
-func (s *Store) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
+func normalizeTaskForStore(task *v1alpha1.Task) error {
 	if task.Metadata == nil {
 		task.Metadata = &v1alpha1.ObjectMeta{}
 	}
@@ -219,28 +238,135 @@ func (s *Store) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	if task.Status == nil {
 		task.Status = &v1alpha1.TaskStatus{}
 	}
-	if task.Status.State == v1alpha1.TaskState_TASK_STATE_UNSPECIFIED && task.Metadata.GetDeleteTime() == nil {
-		task.Status.State = v1alpha1.TaskState_TASK_STATE_QUEUED
-	}
-	return s.save(ctx, tasksTable, task.Metadata, task)
+	return nil
 }
 
-// GetTask retrieves a task by atespace and name.
+// SaveTask stores or replaces a task, keeping indexed state, generation, and
+// session_id columns in sync with the task document without mutating the
+// caller's Task message.
+func (s *Store) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
+	if task == nil {
+		return errors.New("task is required")
+	}
+	cp := proto.Clone(task).(*v1alpha1.Task)
+	if err := normalizeTaskForStore(cp); err != nil {
+		return err
+	}
+	store.ScrubStoredTask(cp)
+	if cp.Status.State == v1alpha1.TaskState_TASK_STATE_UNSPECIFIED && cp.Metadata.GetDeleteTime() == nil {
+		cp.Status.State = v1alpha1.TaskState_TASK_STATE_QUEUED
+	}
+	gen := max(cp.Status.Generation, int64(1))
+	cp.Status.Generation = gen
+	data, err := protojson.Marshal(cp)
+	if err != nil {
+		return fmt.Errorf("marshaling tasks: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO tasks (atespace, name, data, saved_at, state, generation, session_id)
+		VALUES ($1, $2, $3, clock_timestamp(), $4, $5, $6)
+		ON CONFLICT (atespace, name) DO UPDATE
+		SET data = EXCLUDED.data,
+		    saved_at = EXCLUDED.saved_at,
+		    state = EXCLUDED.state,
+		    generation = EXCLUDED.generation,
+		    session_id = EXCLUDED.session_id`,
+		cp.Metadata.Atespace,
+		cp.Metadata.Name,
+		string(data),
+		int16(cp.Status.State),
+		gen,
+		cp.GetSpec().GetSessionId(),
+	)
+	if err != nil {
+		return fmt.Errorf("saving tasks: %w", err)
+	}
+	return nil
+}
+
+// GetTask retrieves a task by atespace and name, merging the authoritative
+// generation column onto status.generation.
 func (s *Store) GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
+	var (
+		data []byte
+		gen  int64
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT data, generation FROM tasks WHERE atespace = $1 AND name = $2`,
+		defaultAtespace(atespace), name,
+	).Scan(&data, &gen)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting tasks: %w", err)
+	}
 	var task v1alpha1.Task
-	if err := s.get(ctx, tasksTable, atespace, name, &task); err != nil {
-		return nil, err
+	if err := unmarshalOpts.Unmarshal(data, &task); err != nil {
+		return nil, fmt.Errorf("unmarshaling tasks: %w", err)
+	}
+	if gen > 0 {
+		if task.Status == nil {
+			task.Status = &v1alpha1.TaskStatus{}
+		}
+		task.Status.Generation = gen
 	}
 	return &task, nil
 }
 
-// ListTasks lists tasks ordered by most recently saved first. A limit <= 0
-// defaults to 50.
+// ListTasks lists tasks ordered by most recently saved first, merging the
+// authoritative generation column onto each returned task's status.generation.
+// A limit <= 0 defaults to 50.
 func (s *Store) ListTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
 	if limit <= 0 {
 		limit = defaultPageLimit
 	}
-	return list(ctx, s, tasksTable, atespace, limit, offset, func() *v1alpha1.Task { return &v1alpha1.Task{} })
+	query := `SELECT data, generation FROM tasks`
+	args := []any{}
+	if atespace != "" && atespace != "*" {
+		query += ` WHERE atespace = $1`
+		args = append(args, atespace)
+	}
+	query += ` ORDER BY saved_at DESC, atespace, name`
+	args = append(args, limit)
+	query += fmt.Sprintf(` LIMIT $%d`, len(args))
+	if offset > 0 {
+		args = append(args, offset)
+		query += fmt.Sprintf(` OFFSET $%d`, len(args))
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*v1alpha1.Task
+	for rows.Next() {
+		var (
+			data []byte
+			gen  int64
+		)
+		if err := rows.Scan(&data, &gen); err != nil {
+			return nil, fmt.Errorf("listing tasks: %w", err)
+		}
+		var task v1alpha1.Task
+		if err := unmarshalOpts.Unmarshal(data, &task); err != nil {
+			slog.Warn("skipping unreadable record", "table", tasksTable, "error", err)
+			continue
+		}
+		if gen > 0 {
+			if task.Status == nil {
+				task.Status = &v1alpha1.TaskStatus{}
+			}
+			task.Status.Generation = gen
+		}
+		out = append(out, &task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing tasks: %w", err)
+	}
+	return out, nil
 }
 
 // UpdateTaskStatus replaces only the status of a task. It does not change the
@@ -248,9 +374,12 @@ func (s *Store) ListTasks(ctx context.Context, atespace string, limit, offset in
 func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error {
 	atespace = defaultAtespace(atespace)
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var data []byte
-		err := tx.QueryRow(ctx, `SELECT data FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE`,
-			atespace, name).Scan(&data)
+		var (
+			data   []byte
+			curGen int64
+		)
+		err := tx.QueryRow(ctx, `SELECT data, generation FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE`,
+			atespace, name).Scan(&data, &curGen)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.ErrNotFound
 		}
@@ -262,11 +391,17 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, sta
 			return fmt.Errorf("unmarshaling task: %w", err)
 		}
 		task.Status = status
+		if task.Status == nil {
+			task.Status = &v1alpha1.TaskStatus{}
+		}
+		gen := max(task.Status.Generation, curGen, int64(1))
+		task.Status.Generation = gen
 		if data, err = protojson.Marshal(&task); err != nil {
 			return fmt.Errorf("marshaling task status: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET data = $3 WHERE atespace = $1 AND name = $2`,
-			atespace, name, string(data)); err != nil {
+		if _, err := tx.Exec(ctx,
+			`UPDATE tasks SET data = $3, state = $4, generation = $5 WHERE atespace = $1 AND name = $2`,
+			atespace, name, string(data), int16(task.Status.State), gen); err != nil {
 			return fmt.Errorf("updating task status: %w", err)
 		}
 		return nil
@@ -278,9 +413,12 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, sta
 func (s *Store) SetTaskDeleteTime(ctx context.Context, atespace, name string, deleteTime *timestamppb.Timestamp) error {
 	atespace = defaultAtespace(atespace)
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var data []byte
-		err := tx.QueryRow(ctx, `SELECT data FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE`,
-			atespace, name).Scan(&data)
+		var (
+			data   []byte
+			curGen int64
+		)
+		err := tx.QueryRow(ctx, `SELECT data, generation FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE`,
+			atespace, name).Scan(&data, &curGen)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.ErrNotFound
 		}
@@ -293,6 +431,12 @@ func (s *Store) SetTaskDeleteTime(ctx context.Context, atespace, name string, de
 		}
 		if task.Metadata == nil {
 			task.Metadata = &v1alpha1.ObjectMeta{Atespace: atespace, Name: name}
+		}
+		if curGen > 0 {
+			if task.Status == nil {
+				task.Status = &v1alpha1.TaskStatus{}
+			}
+			task.Status.Generation = curGen
 		}
 		task.Metadata.DeleteTime = deleteTime
 		if data, err = protojson.Marshal(&task); err != nil {
@@ -347,6 +491,36 @@ func (s *Store) ListWorkspaces(ctx context.Context, atespace string, limit, offs
 		limit = defaultPageLimit
 	}
 	return list(ctx, s, workspacesTable, atespace, limit, offset, func() *v1alpha1.Workspace { return &v1alpha1.Workspace{} })
+}
+
+// UpdateWorkspaceStatus replaces only the status of a workspace without
+// altering its saved_at ordering.
+func (s *Store) UpdateWorkspaceStatus(ctx context.Context, atespace, name string, status *v1alpha1.WorkspaceStatus) error {
+	atespace = defaultAtespace(atespace)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var data []byte
+		err := tx.QueryRow(ctx, `SELECT data FROM workspaces WHERE atespace = $1 AND name = $2 FOR UPDATE`,
+			atespace, name).Scan(&data)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return store.ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("getting workspace: %w", err)
+		}
+		var ws v1alpha1.Workspace
+		if err := unmarshalOpts.Unmarshal(data, &ws); err != nil {
+			return fmt.Errorf("unmarshaling workspace: %w", err)
+		}
+		ws.Status = status
+		if data, err = protojson.Marshal(&ws); err != nil {
+			return fmt.Errorf("marshaling workspace status: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE workspaces SET data = $3 WHERE atespace = $1 AND name = $2`,
+			atespace, name, string(data)); err != nil {
+			return fmt.Errorf("updating workspace status: %w", err)
+		}
+		return nil
+	})
 }
 
 // DeleteWorkspace removes a workspace. Deleting a missing workspace is not an error.

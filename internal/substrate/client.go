@@ -243,7 +243,8 @@ var (
 )
 
 // IsTransientError reports whether err represents a transient Substrate
-// control-plane unavailability or timeout rather than a permanent failure.
+// control-plane unavailability, lease conflict, or timeout rather than a
+// permanent failure.
 func IsTransientError(err error) bool {
 	if err == nil {
 		return false
@@ -251,9 +252,10 @@ func IsTransientError(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
-	if st, ok := status.FromError(err); ok {
-		switch st.Code() {
-		case codes.Unavailable, codes.DeadlineExceeded:
+	var gs interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &gs) && gs.GRPCStatus() != nil {
+		switch gs.GRPCStatus().Code() {
+		case codes.Unavailable, codes.DeadlineExceeded, codes.Aborted:
 			return true
 		}
 	}
@@ -519,6 +521,18 @@ func (c *Client) resolveExistingActor(ctx context.Context, req *ateapipb.CreateA
 	if err != nil || existing == nil {
 		return existing, err
 	}
+	if existing.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_DELETING {
+		existingTpl := existing.GetActorTemplate().GetName()
+		wantTpl := req.GetActor().GetActorTemplate().GetName()
+		legacyPrefix := actorName + "-tmpl-"
+		if existingTpl != "" && wantTpl != "" && existingTpl != wantTpl &&
+			!strings.HasPrefix(existingTpl, legacyPrefix) &&
+			!strings.HasPrefix(wantTpl, legacyPrefix) {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"actor %s/%s already exists with template %q (want %q)",
+				atespace, actorName, existingTpl, wantTpl)
+		}
+	}
 	switch existing.GetStatus().GetState() {
 	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
 		return c.recoverCrashedActor(ctx, req, atespace, actorName)
@@ -610,7 +624,39 @@ func WorkerIP(actor *ateapipb.Actor) string {
 	return ""
 }
 
-// SuspendActor suspends the specified actor, triggering state checkpointing.
+// ActiveSnapshotGeneration returns the highest durable (COMPLETED)
+// Snapshot.generation currently held on actor's status, or 0 when the actor
+// holds no completed durable snapshot.
+//
+// Callers checking whether RevertActor rolled an actor back past a prior
+// checkpoint MUST use ActiveSnapshotGeneration rather than
+// ActorStatus.last_assigned_generation (which Substrate keeps monotonic across
+// reverts) and MUST ignore PENDING node-local snapshots (which RevertActor
+// discards).
+func ActiveSnapshotGeneration(actor *ateapipb.Actor) int32 {
+	var maxGen int32
+	for _, snap := range actor.GetStatus().GetSnapshots() {
+		if snap.GetDurableSnapshot().GetState() != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			continue
+		}
+		if g := snap.GetGeneration(); g > maxGen {
+			maxGen = g
+		}
+	}
+	return maxGen
+}
+
+func hasLocalOrPendingSnapshot(actor *ateapipb.Actor) bool {
+	for _, snap := range actor.GetStatus().GetSnapshots() {
+		if snap.GetLocality() != "" ||
+			snap.GetDurableSnapshot().GetState() != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			return true
+		}
+	}
+	return false
+}
+
+// SuspendActor suspends the specified actor asynchronously, triggering state checkpointing.
 func (c *Client) SuspendActor(ctx context.Context, atespace, actorName string) error {
 	req := &ateapipb.SuspendActorRequest{
 		Actor: &ateapipb.ObjectRef{
@@ -627,6 +673,88 @@ func (c *Client) SuspendActor(ctx context.Context, atespace, actorName string) e
 	return nil
 }
 
+// SuspendActorSync suspends the specified actor with DURABILITY_MODE_SYNCHRONOUS,
+// blocking until the checkpoint reaches durable storage, and returns the
+// suspended Actor along with its active Snapshot.generation.
+func (c *Client) SuspendActorSync(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, int32, error) {
+	req := &ateapipb.SuspendActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+		Options: &ateapipb.SuspendOptions{
+			Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS,
+		},
+	}
+	resp, err := callWithRetry(ctx, func() (*ateapipb.SuspendActorResponse, error) {
+		return c.control.SuspendActor(ctx, req)
+	}, codes.Aborted)
+	if err != nil {
+		return nil, 0, fmt.Errorf("suspending actor %s/%s synchronously: %w", atespace, actorName, err)
+	}
+	actor := resp.GetActor()
+	return actor, ActiveSnapshotGeneration(actor), nil
+}
+
+// RevertActor rolls the specified actor back to its most recent durable
+// snapshot, leaving it SUSPENDED, and returns the reverted Actor and its active
+// Snapshot.generation.
+//
+// RevertActor is idempotent for queue retries:
+//   - If a previous attempt already returned the actor to ACTOR_STATE_SUSPENDED
+//     at its durable snapshot (no node-local or PENDING snapshot), RevertActor
+//     treats Substrate's FailedPrecondition as a no-op success.
+//   - If an asynchronous SUSPENDING or RESUMING transition caused the initial
+//     FailedPrecondition, RevertActor re-invokes RevertActor when the actor is
+//     now revertable (including SUSPENDED with a node-local snapshot) or returns
+//     a retryable Aborted status while the transitional operation finishes.
+func (c *Client) RevertActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, int32, error) {
+	req := &ateapipb.RevertActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	}
+	resp, err := callWithRetry(ctx, func() (*ateapipb.RevertActorResponse, error) {
+		return c.control.RevertActor(ctx, req)
+	}, codes.Aborted)
+	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			existing, getErr := c.GetActor(ctx, atespace, actorName)
+			if getErr == nil && existing != nil {
+				switch existing.GetStatus().GetState() {
+				case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+					if !hasLocalOrPendingSnapshot(existing) {
+						return existing, ActiveSnapshotGeneration(existing), nil
+					}
+					if retryResp, retryErr := callWithRetry(ctx, func() (*ateapipb.RevertActorResponse, error) {
+						return c.control.RevertActor(ctx, req)
+					}, codes.Aborted); retryErr == nil {
+						actor := retryResp.GetActor()
+						return actor, ActiveSnapshotGeneration(actor), nil
+					}
+				case ateapipb.ActorState_ACTOR_STATE_RUNNING, ateapipb.ActorState_ACTOR_STATE_CRASHED:
+					if retryResp, retryErr := callWithRetry(ctx, func() (*ateapipb.RevertActorResponse, error) {
+						return c.control.RevertActor(ctx, req)
+					}, codes.Aborted); retryErr == nil {
+						actor := retryResp.GetActor()
+						return actor, ActiveSnapshotGeneration(actor), nil
+					}
+				case ateapipb.ActorState_ACTOR_STATE_RESUMING,
+					ateapipb.ActorState_ACTOR_STATE_SUSPENDING,
+					ateapipb.ActorState_ACTOR_STATE_REVERTING:
+					return nil, 0, status.Errorf(codes.Aborted,
+						"reverting actor %s/%s: actor in transitional state %s",
+						atespace, actorName, existing.GetStatus().GetState())
+				}
+			}
+		}
+		return nil, 0, fmt.Errorf("reverting actor %s/%s: %w", atespace, actorName, err)
+	}
+	actor := resp.GetActor()
+	return actor, ActiveSnapshotGeneration(actor), nil
+}
+
 // GetActor fetches an Actor by name.
 func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, error) {
 	req := &ateapipb.GetActorRequest{
@@ -640,23 +768,41 @@ func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ate
 	})
 }
 
+// ListActorsPage fetches a single page of Actors in the given atespace (or
+// across all atespaces when atespace is empty), allowing callers such as the
+// drift sweep to rate-limit per page.
+func (c *Client) ListActorsPage(ctx context.Context, atespace string, pageSize int32, pageToken string) ([]*ateapipb.Actor, string, error) {
+	req := &ateapipb.ListActorsRequest{
+		Atespace: atespace,
+		Options: &ateapipb.ListOptions{
+			PageSize:  pageSize,
+			PageToken: pageToken,
+		},
+	}
+	resp, err := callWithRetry(ctx, func() (*ateapipb.ListActorsResponse, error) {
+		return c.control.ListActors(ctx, req)
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("listing actors in %q: %w", atespace, err)
+	}
+	return resp.GetActors(), resp.GetNextPageToken(), nil
+}
+
 // ListActors returns every Actor in the given atespace, or in all atespaces
 // when atespace is empty.
 func (c *Client) ListActors(ctx context.Context, atespace string) ([]*ateapipb.Actor, error) {
 	var actors []*ateapipb.Actor
-	req := &ateapipb.ListActorsRequest{Atespace: atespace, Options: &ateapipb.ListOptions{}}
+	var token string
 	for {
-		resp, err := callWithRetry(ctx, func() (*ateapipb.ListActorsResponse, error) {
-			return c.control.ListActors(ctx, req)
-		})
+		page, next, err := c.ListActorsPage(ctx, atespace, 0, token)
 		if err != nil {
-			return nil, fmt.Errorf("listing actors in %q: %w", atespace, err)
+			return nil, err
 		}
-		actors = append(actors, resp.GetActors()...)
-		if resp.GetNextPageToken() == "" {
+		actors = append(actors, page...)
+		if next == "" {
 			return actors, nil
 		}
-		req.Options.PageToken = resp.GetNextPageToken()
+		token = next
 	}
 }
 
@@ -702,6 +848,17 @@ func (c *Client) EnsureActorEgressPolicy(ctx context.Context, atespace, actorNam
 		return fmt.Errorf("creating egress policy of actor %s/%s: %w", atespace, actorName, err)
 	}
 	return nil
+}
+
+// EnsureActorEgress applies the actor's outbound EgressPolicy.
+//
+// TODO: Prepend the built-in :8081 ActorJwtSource runner rule ahead of
+// gatewayRules once the runner HTTP server is wired up.
+func (c *Client) EnsureActorEgress(ctx context.Context, atespace, actorName string, gatewayRules []*ateapipb.EgressRule) error {
+	if len(gatewayRules) == 0 {
+		return nil
+	}
+	return c.EnsureActorEgressPolicy(ctx, atespace, actorName, gatewayRules)
 }
 
 // DeleteActor deletes the specified actor from Substrate and blocks until the actor

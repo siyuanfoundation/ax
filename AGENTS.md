@@ -23,20 +23,21 @@ cmd/ax-server          Control plane: gRPC API; provisions, suspends, resumes an
 cmd/ax-task-runner     PID 1 inside the sandbox; materializes the Workspace, runs the agent
 internal/apivalidation Manifest admission validation (common, task, workspace, model, gateway); server-side only
 internal/controller    TaskReconciler: Substrate side of task suspend/resume/delete; reconciler_test.go is the test template
+internal/lifecycle     Pure Task lifecycle state machine (Transition, NextReconcileAt) and action queue types
 internal/resources     Kubernetes CPU/memory resource quantity parsing
-internal/server        gRPC handlers
-internal/store/        memory + postgres backends (schema.sql and schema.go change together)
-internal/substrate     The only place that talks to the Substrate Control API
+internal/server        gRPC handlers and server extension hooks (hooks.go)
+internal/store/        memory + postgres backends, transactional TaskApplier, queue & workspace snapshot contracts (schema.sql and schema.go change together)
+internal/substrate     The only place that talks to the Substrate Control API (Client + RuntimeClient)
 internal/workspace     spec.setup execution (git clone / inline files / skills dir / commands; MCP is read via metadata server)
 internal/{tunnel,guest,metadata}  k8s port-forward, in-sandbox guest client, metadata server
 internal/telemetry     ax-server's OpenTelemetry setup: OTLP traces, metrics, and events (Emit, stdout fallback), Prometheus /metrics (:9090), JSON slog with trace IDs
 internal/telemetry/otelenv  OpenTelemetry rules ax-server and the CLI share: OTEL_*_EXPORTER parsing and the resource
 internal/axattr        OpenTelemetry attribute names (ax.task.*, and Substrate's ate.* for actor identity)
+pkg/apis/runner/v1     runner.proto -> runner.pb.go (generated), protocol.go (runner <-> ax-server :8081 wire contract)
 pkg/apis/v1alpha1      *.proto (source of truth) -> *.pb.go (generated), types.go (constants + YAML codec)
 test/e2e               Kind-based; compiled by `go test ./...` but self-skips without AX_E2E=true
-hack/                  E2E provisioning scripts; apply-rulesets.sh; tools/buf/go.mod pins buf for `make generate`
+hack/                  E2E provisioning scripts; apply-rulesets.sh; tools/<name>/go.mod pins buf (`make generate`) and golangci-lint (`make verify`)
 .github/rulesets/      GitHub rulesets as code (source of truth); applied by an admin with hack/apply-rulesets.sh (docs/rulesets.md)
-hack/                  E2E provisioning scripts; tools/<name>/go.mod pins buf (`make generate`) and golangci-lint (`make verify`)
 docs/                  manifests.md is the user-facing API reference
 skills/                Developer skills (SKILL.md format). .agents/skills, .claude/skills, and .gemini/skills symlink here.
 ```
@@ -47,7 +48,7 @@ skills/                Developer skills (SKILL.md format). .agents/skills, .clau
 export GOTOOLCHAIN=auto          # go.mod wants 1.27.1; older local Go auto-downloads it
 make verify                      # make generate, go mod tidy, go fmt, golangci-lint (CI asserts no diff)
 go build ./cmd/ax ./cmd/ax-server ./cmd/ax-task-runner
-go test ./...                    # ~20 s, 21 packages with tests; Postgres + E2E tiers self-skip
+go test ./...                    # ~20 s, 23 packages with tests; Postgres + E2E tiers self-skip
 ```
 
 Opt-in tiers:
@@ -60,11 +61,12 @@ Each rule below is enforced by code, CI, or `CONTRIBUTING.md`; the cited
 location is where to look. How-to lives in the skills.
 
 **A. Correctness**
-- `pkg/apis/v1alpha1/*.proto` are the source of truth: `ax.proto` is the `AX`
-  service, and the messages are in `common.proto`, `task.proto`,
-  `workspace.proto`, `model.proto`, and `gateway.proto`. `*.pb.go` are
-  generated (`DO NOT EDIT` headers); run `make generate` after editing a
-  `.proto`. Imports are repo-root-relative, except `google/rpc/status.proto`
+- `pkg/apis/v1alpha1/*.proto` and `pkg/apis/runner/v1/runner.proto` are the
+  source of truth: `ax.proto` is the `AX` service, the public messages are in
+  `common.proto`, `task.proto`, `workspace.proto`, `model.proto`, and
+  `gateway.proto`, and the runner control wire protocol is in `runner.proto`.
+  `*.pb.go` are generated (`DO NOT EDIT` headers); run `make generate` after
+  editing a `.proto`. Imports are repo-root-relative, except `google/rpc/status.proto`
   (`buf.build/googleapis/googleapis`, pinned in `buf.lock`) and Agent
   Substrate's `api/ateapi/v1/ateapi.proto` (`make generate` links that module
   from the Go module cache into `.tmp/buf/substrate` for `buf.yaml`).

@@ -18,7 +18,10 @@ package substratetest
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"sort"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -40,7 +43,9 @@ type Errors struct {
 	CreateEgressPolicy error
 	SuspendActor       error
 	ResumeActor        error
+	RevertActor        error
 	DeleteActor        error
+	ListActors         error
 	CreateTag          error
 	DeleteTag          error
 }
@@ -309,9 +314,29 @@ func (s *Server) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest
 		}
 	}
 	actor := proto.Clone(req.GetActor()).(*ateapipb.Actor)
+	if actor.Metadata == nil {
+		actor.Metadata = &ateapipb.ResourceMetadata{}
+	}
+	if actor.Metadata.Uid == "" {
+		actor.Metadata.Uid = "actor-uid-" + k
+	}
 	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
+	if req.GetActor().GetSourceTag() != nil {
+		actor.Status.LastAssignedGeneration = 1
+		actor.Status.Snapshots = []*ateapipb.Snapshot{completedSnapshot(1)}
+	}
 	s.actors[k] = actor
 	return proto.Clone(actor).(*ateapipb.Actor), nil
+}
+
+func completedSnapshot(gen int32) *ateapipb.Snapshot {
+	return &ateapipb.Snapshot{
+		Uuid:       fmt.Sprintf("snap-%d", gen),
+		Generation: gen,
+		DurableSnapshot: &ateapipb.SnapshotStorage{
+			State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+		},
+	}
 }
 
 func (s *Server) SuspendActor(_ context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
@@ -324,8 +349,22 @@ func (s *Server) SuspendActor(_ context.Context, req *ateapipb.SuspendActorReque
 	if err != nil {
 		return nil, err
 	}
-	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
-	return &ateapipb.SuspendActorResponse{}, nil
+	if actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is crashed", req.GetActor().GetAtespace(), req.GetActor().GetName())
+	}
+	prevState := actor.GetStatus().GetState()
+	lastGen := actor.GetStatus().GetLastAssignedGeneration()
+	snaps := actor.GetStatus().GetSnapshots()
+	if prevState != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		lastGen++
+		snaps = []*ateapipb.Snapshot{completedSnapshot(lastGen)}
+	}
+	actor.Status = &ateapipb.ActorStatus{
+		State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		Snapshots:              snaps,
+		LastAssignedGeneration: lastGen,
+	}
+	return &ateapipb.SuspendActorResponse{Actor: proto.Clone(actor).(*ateapipb.Actor)}, nil
 }
 
 func (s *Server) ResumeActor(_ context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
@@ -338,23 +377,57 @@ func (s *Server) ResumeActor(_ context.Context, req *ateapipb.ResumeActorRequest
 	if err != nil {
 		return nil, err
 	}
-	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}
+	actor.Status = &ateapipb.ActorStatus{
+		State:                  ateapipb.ActorState_ACTOR_STATE_RUNNING,
+		Snapshots:              actor.GetStatus().GetSnapshots(),
+		LastAssignedGeneration: actor.GetStatus().GetLastAssignedGeneration(),
+	}
 	if s.workerIP != "" {
 		actor.Status.WorkerAssignment = &ateapipb.WorkerAssignment{WorkerPod: "worker-pod-1", WorkerPodIps: []string{s.workerIP}}
 	}
 	return &ateapipb.ResumeActorResponse{Actor: proto.Clone(actor).(*ateapipb.Actor), Resumed: true}, nil
 }
 
-// RevertActor leaves the actor suspended, as if restored from its last
-// snapshot.
+// RevertActor leaves the actor suspended, preserving its durable snapshots and
+// monotonic last_assigned_generation as Substrate does. Matching Substrate's
+// controlapi workflow, RevertActor rejects an actor that is already SUSPENDED
+// at its durable snapshot (no node-local snapshot) with FailedPrecondition.
 func (s *Server) RevertActor(_ context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.errs.RevertActor != nil {
+		return nil, s.errs.RevertActor
+	}
 	actor, err := s.lookupActor(req.GetActor())
 	if err != nil {
 		return nil, err
 	}
-	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
+	st := actor.GetStatus().GetState()
+	hasLocal := false
+	var durableSnaps []*ateapipb.Snapshot
+	for _, snap := range actor.GetStatus().GetSnapshots() {
+		if snap.GetLocality() != "" {
+			hasLocal = true
+		}
+		if snap.GetDurableSnapshot().GetState() == ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			cp := proto.Clone(snap).(*ateapipb.Snapshot)
+			cp.Locality = ""
+			durableSnaps = append(durableSnaps, cp)
+		}
+	}
+	revertable := st == ateapipb.ActorState_ACTOR_STATE_RUNNING ||
+		st == ateapipb.ActorState_ACTOR_STATE_CRASHED ||
+		(st == ateapipb.ActorState_ACTOR_STATE_SUSPENDED && hasLocal)
+	if !revertable {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"actor %s/%s is not in a revertable state (got %s)",
+			req.GetActor().GetAtespace(), req.GetActor().GetName(), st)
+	}
+	actor.Status = &ateapipb.ActorStatus{
+		State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		Snapshots:              durableSnaps,
+		LastAssignedGeneration: actor.GetStatus().GetLastAssignedGeneration(),
+	}
 	return &ateapipb.RevertActorResponse{Actor: proto.Clone(actor).(*ateapipb.Actor)}, nil
 }
 
@@ -431,11 +504,35 @@ func (s *Server) GetActor(_ context.Context, req *ateapipb.GetActorRequest) (*at
 func (s *Server) ListActors(_ context.Context, req *ateapipb.ListActorsRequest) (*ateapipb.ListActorsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	resp := &ateapipb.ListActorsResponse{}
-	for _, actor := range s.actors {
+	if s.errs.ListActors != nil {
+		return nil, s.errs.ListActors
+	}
+	keys := make([]string, 0, len(s.actors))
+	for k, actor := range s.actors {
 		if req.GetAtespace() == "" || actor.GetMetadata().GetAtespace() == req.GetAtespace() {
-			resp.Actors = append(resp.Actors, proto.Clone(actor).(*ateapipb.Actor))
+			keys = append(keys, k)
 		}
+	}
+	sort.Strings(keys)
+
+	start := 0
+	if tok := req.GetOptions().GetPageToken(); tok != "" {
+		idx, err := strconv.Atoi(tok)
+		if err != nil || idx < 0 {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid page_token %q", tok)
+		}
+		start = min(idx, len(keys))
+	}
+	end := len(keys)
+	var nextToken string
+	if pageSize := int(req.GetOptions().GetPageSize()); pageSize > 0 && start+pageSize < end {
+		end = start + pageSize
+		nextToken = strconv.Itoa(end)
+	}
+
+	resp := &ateapipb.ListActorsResponse{NextPageToken: nextToken}
+	for _, k := range keys[start:end] {
+		resp.Actors = append(resp.Actors, proto.Clone(s.actors[k]).(*ateapipb.Actor))
 	}
 	return resp, nil
 }
@@ -465,8 +562,12 @@ func (s *Server) CreateTag(_ context.Context, req *ateapipb.CreateTagRequest) (*
 			tmplUID = tpl.GetMetadata().GetUid()
 		}
 	}
+	gen := max(substrate.ActiveSnapshotGeneration(src), 1)
 	tag := proto.Clone(in).(*ateapipb.Tag)
-	tag.Status = &ateapipb.TagStatus{ActorTemplateUid: tmplUID}
+	tag.Status = &ateapipb.TagStatus{
+		ActorTemplateUid: tmplUID,
+		Snapshot:         completedSnapshot(gen),
+	}
 	s.tags[k] = tag
 	return proto.Clone(tag).(*ateapipb.Tag), nil
 }

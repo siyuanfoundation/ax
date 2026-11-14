@@ -1,0 +1,179 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package ax.runner.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "pkg/apis/v1alpha1/task.proto";
+import "pkg/apis/v1alpha1/workspace.proto";
+
+option go_package = "github.com/google/ax/pkg/apis/runner/v1;runnerv1";
+
+// AssignmentMode tells ax-task-runner what to execute on boot or wakeup.
+enum AssignmentMode {
+  ASSIGNMENT_MODE_UNSPECIFIED = 0;
+  // Kill any leftover task-uid processes and sit idle serving /readyz until
+  // parked or woken again.
+  ASSIGNMENT_MODE_IDLE = 1;
+  // Kill leftover task-uid processes, clear /workspace/.ax/output*, write
+  // goal.md & config.json, persist (actor_uid, run_id) in /var/lib/ax/state.json,
+  // wait start_delay, and spawn exec.
+  ASSIGNMENT_MODE_RUN = 2;
+  // Continue supervising the live in_memory_run_id process across a MEMORY
+  // snapshot restore.
+  ASSIGNMENT_MODE_RESUME = 3;
+  reserved 4; // Reserved for deferred platform verifier execution.
+  // Execute Workspace.spec.setup (git, files, skills, commands), report
+  // setup_finished, and wait for the next step or snapshot checkpoint.
+  ASSIGNMENT_MODE_SETUP = 5;
+}
+
+// ClaimAssignmentRequest is sent by ax-task-runner on initial startup and on
+// every wakeup probe.
+message ClaimAssignmentRequest {
+  // Active run ID held in PID 1 memory; empty on cold boot.
+  string in_memory_run_id = 1;
+  // Last started run ID persisted in /var/lib/ax/state.json for the current
+  // actor_uid; rewound when RevertActor rolls storage back, and ignored when
+  // /run/ate's actor_uid differs from the persisted actor_uid.
+  string last_started_run_id = 2;
+  // True when the in_memory_run_id child process is still alive.
+  bool child_alive = 3;
+  // Per-wakeup random nonce making claim retries idempotent if the HTTP
+  // response is lost after commit.
+  string nonce = 4;
+}
+
+// ClaimAssignmentResponse describes the assignment returned by ax-server.
+message ClaimAssignmentResponse {
+  AssignmentMode mode = 1;
+  string run_id = 2;
+  int32 attempt = 3;
+  // Populated only when ax-server mints (or re-mints on an unstarted initial
+  // nonce retry) the per-actor runner token.
+  string runner_token = 4;
+  // Task resource served read-only on loopback /metadata/v1alpha1/ax/task.
+  // Omitted for temporary workspace setup actors that are not Tasks.
+  ax.v1alpha1.Task task = 5;
+  // Bound Workspace (including dynamically resolved spec.mcp) served on
+  // loopback /metadata/v1alpha1/ax/workspace.
+  ax.v1alpha1.Workspace workspace = 6;
+  // Command execution specification; populated when mode is ASSIGNMENT_MODE_RUN.
+  ExecSpec exec = 7;
+  // Goal context written to /workspace/.ax/goal.md and served on loopback
+  // /metadata/v1alpha1/ax/goal.
+  GoalPayload goal = 8;
+  reserved 9, 10; // Reserved for deferred verifiers and control-plane turns.
+  // Retry backoff to sleep before spawning exec (0 = start immediately).
+  google.protobuf.Duration start_delay = 11;
+}
+
+// ExecSpec configures the supervised child command for ASSIGNMENT_MODE_RUN.
+message ExecSpec {
+  // Effective command argv (from task.status.resolved_argv).
+  repeated string argv = 1;
+  // Effective working directory (from task.spec.WorkspacePath()).
+  string workdir = 2;
+  // Merged environment variables (task.spec.env + AX_* metadata/file paths and
+  // gateway CA bundle variables).
+  map<string, string> env = 3;
+  // Non-root UID to drop the child process to (defaults to 1000).
+  int32 run_as_uid = 4;
+}
+
+// GoalPayload carries the task's natural-language goal and prior retry failure.
+message GoalPayload {
+  // Natural-language goal from task.spec.goal.spec.
+  string spec = 1;
+  // Summary of the previous attempt's failure (from task.status.previous_failure);
+  // empty on attempt 1.
+  string previous_failure = 2;
+}
+
+// ReportEventsRequest delivers ordered lifecycle events and heartbeats from
+// ax-task-runner to ax-server.
+message ReportEventsRequest {
+  // Active run_id; empty during ASSIGNMENT_MODE_SETUP.
+  string run_id = 1;
+  repeated RunnerEvent events = 2;
+}
+
+// RunnerEvent is a single sequenced event emitted by ax-task-runner.
+message RunnerEvent {
+  int64 seq = 1;
+  google.protobuf.Timestamp time = 2;
+  oneof event {
+    SetupFinished setup_finished = 3;
+    CommandStarted command_started = 4;
+    CommandExited command_exited = 5;
+    EvictionNotice eviction_notice = 7;
+    IdleNotice idle_notice = 8;
+    Heartbeat heartbeat = 9;
+  }
+  reserved 6, 10; // Reserved for deferred verifier_finished and suspend_request.
+}
+
+message SetupFinished {
+  bool ok = 1;
+  string message = 2;
+}
+
+message CommandStarted {
+  int32 pid = 1;
+}
+
+message CommandExited {
+  int32 exit_code = 1;
+  string signal = 2;
+  // Unstructured output from $AX_OUTPUT_FILE or 64 KiB stdout/stderr tail.
+  string output = 3;
+  // Optional structured JSON output from $AX_OUTPUT_JSON_FILE or loopback POST.
+  google.protobuf.Struct structured_output = 4;
+  ExitCause cause = 5;
+}
+
+enum ExitCause {
+  EXIT_CAUSE_UNSPECIFIED = 0;
+  EXIT_CAUSE_EXITED = 1;
+  EXIT_CAUSE_SIGNALED = 2;
+  EXIT_CAUSE_OOM_KILLED = 3;
+  EXIT_CAUSE_DISK_FULL = 4;
+}
+
+message EvictionNotice {
+  google.protobuf.Timestamp deadline = 1;
+}
+
+message IdleNotice {
+  // Seconds of inactivity observed before parking (0 when explicitly requested
+  // via POST /metadata/v1alpha1/ax/idle).
+  int64 idle_seconds = 1;
+  string output = 2;
+  google.protobuf.Struct structured_output = 3;
+}
+
+message Heartbeat {}
+
+message ReportEventsResponse {
+  int64 ack_seq = 1;
+  // Optional piggybacked next assignment (e.g. IDLE on completion or RUN with
+  // start_delay on in-place retry). When next is ASSIGNMENT_MODE_RUN and
+  // next.workspace is omitted, ax-task-runner retains its previously claimed
+  // Workspace metadata.
+  ClaimAssignmentResponse next = 2;
+}

@@ -20,9 +20,14 @@ import (
 	"testing"
 
 	"github.com/google/ax/internal/store/memory"
+	"github.com/google/ax/internal/store/storetest"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestStoreContract(t *testing.T) {
+	storetest.RunContract(t, memory.NewStore())
+}
 
 func TestListPagination(t *testing.T) {
 	ctx := t.Context()

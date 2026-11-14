@@ -18,7 +18,7 @@ and `hack/setup-e2e-kind.sh` if they look stale.
 
 | Module | Pinned | Provides | Imported by |
 |---|---|---|---|
-| `go.ate.dev/substrate` | `v1.0.0` | Control API protos `api/ateapi/v1` (atespaces, actor templates, actors, tags, snapshot fidelity, suspend/resume, egress rules) | `internal/substrate`, `internal/substrate/substratetest`, `internal/server`, `internal/controller`, `internal/apivalidation`, `test/e2e`, `pkg/apis/v1alpha1` (its `.proto` files import `ateapi.proto`) |
+| `go.ate.dev/substrate` | `v1.0.0` | Control API protos `api/ateapi/v1` (atespaces, actor templates, actors, tags, snapshot fidelity, suspend/resume, egress rules) | `internal/substrate`, `internal/substrate/substratetest`, `internal/lifecycle`, `internal/store`, `internal/store/postgres`, `internal/store/storetest`, `internal/server`, `internal/controller`, `internal/apivalidation`, `test/e2e`, `pkg/apis/v1alpha1` (its `.proto` files import `ateapi.proto`) |
 | `github.com/agent-substrate/env` | `v0.0.11-0.20260912052224-4468a200b170` (pseudo-version) | Guest services served inside the sandbox (process exec + file system gRPC) and `proto/ateenv/v1alpha` | `internal/guest`, `internal/metadata` |
 
 There is no `replace` directive for either module. Local hacking against a
@@ -35,11 +35,14 @@ All Control API traffic goes through this package. It encapsulates:
   token with audience `api.ate-system.svc`, see `deploy/ax-server.yaml`), CA
   from `SUBSTRATE_CA_FILE`.
 - **Retry** — `IsTransientError` + `callWithRetry` (`retryOnCodes`) for `Unavailable`-class errors.
-- **Helpers** the reconcilers rely on — `EnsureAtespace`, `EnsureActorTemplate`,
-  `EnsureActorTemplateWithImage`, `BuildActorTemplate`, `EnsureActor`,
-  `EnsureActorFromTag`, `GetActorEgressPolicy`, `EnsureActorEgressPolicy`,
-  `CreateTag`, `GetTag`, `ListTags`, `DeleteTag`, `SuspendActor`, `ResumeActor`,
-  `DeleteActor`, `WorkerIP`, `ResourceLimits`.
+- **Helpers** the reconcilers rely on (`RuntimeClient` in `runtime.go`) —
+  `EnsureAtespace`, `EnsureActorTemplate`, `EnsureActorTemplateWithImage`,
+  `BuildActorTemplate`, `EnsureActor`, `EnsureActorFromTag`,
+  `GetActorEgressPolicy`, `EnsureActorEgressPolicy`, `EnsureActorEgress`,
+  `CreateTag`, `GetTag`, `ListTags`, `DeleteTag`, `SuspendActor`,
+  `SuspendActorSync`, `ResumeActor`, `RevertActor`, `DeleteActor`,
+  `ListActors`, `ListActorsPage`, `ActiveSnapshotGeneration`,
+  `IsRetryableActionError`, `WorkerIP`, `ResourceLimits`.
 
 ### Where a new Control API call lives today
 
@@ -119,10 +122,14 @@ instead. No mocking library is in `go.mod`.
 - Guest services (process + fs) are mounted by `internal/metadata/server.go`
   only when `task.Spec.Debug` is true; `ax ssh` (`cmd/ax/main.go`) refuses to
   connect otherwise.
-- Trust bundle: `BuildActorTemplate` mounts `egress-mitm.ate.dev` and
-  `system-roots.ate.dev` at `v1alpha1.EgressTrustBundlePath` for every task,
-  and the runner points the CA variables at it (`runner/env.go`). A
-  Substrate install that lacks either bundle blocks actor startup.
+- Trust bundle & `SystemInfo` mounts: `BuildActorTemplate` mounts
+  `egress-mitm.ate.dev` and `system-roots.ate.dev` at
+  `v1alpha1.EgressTrustBundlePath` for every task, and the runner points the CA
+  variables at it (`runner/env.go`). A Substrate install that lacks either
+  bundle blocks actor startup. Substrate rejects nested container `VolumeMount`
+  paths (`mounts must not nest`), so adding `/run/ate/actor-uid` (`ActorMetadata`)
+  alongside the trust bundle requires combining both `DataSources` inside a
+  single `SystemInfo` volume mounted at `/run/ate`.
 - Credential injection replaces a header only on requests that carry it. The
   runner supplies a placeholder only for git: `GIT_ASKPASS` is
   `/ax/git-askpass`, a link to the running program, and package `runner`

@@ -16,6 +16,7 @@
 # Runs the AX Go E2E test suite against an already-provisioned Kind cluster.
 
 set -euo pipefail
+export GOWORK=off
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"

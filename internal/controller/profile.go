@@ -87,19 +87,22 @@ func (p profile) templateName(runnerImage string) string {
 }
 
 // ResolveProfileTemplate resolves p into a deterministic Substrate
-// ActorTemplate name and specification. Callers in controller fill p.Image with
-// the server's configured default task image before calling when omitted.
-//
-// When p sets ate_actor_template, ResolveProfileTemplate returns that template
-// name with a nil *ateapipb.ActorTemplate so the caller looks up the existing
-// user-managed template on Substrate (surfacing NotFound if it is missing)
-// rather than creating an AX-managed template.
-//
-// Otherwise, omitted resource limits fall back to Substrate's default CPU/memory
-// limits, SnapshotConfig.PreferredFidelity defaults to SNAPSHOT_FIDELITY_ROOTFS,
-// and the content-addressed template ("ax-<16-char-sha256>", hashed over the
-// profile and runner volume image) is returned ready for EnsureActorTemplate.
+// ActorTemplate name and specification using [v1alpha1.DefaultTaskImage] when p
+// omits image. Callers that configure a custom server default task image should
+// call [ResolveProfileTemplateWithDefaults] so workspace snapshot pre-warming
+// and task provisioning always hash to the exact same template name.
 func ResolveProfileTemplate(atespace string, p *v1alpha1.Profile, runnerImage string) (string, *ateapipb.ActorTemplate, error) {
+	return ResolveProfileTemplateWithDefaults(atespace, p, v1alpha1.DefaultTaskImage, runnerImage)
+}
+
+// ResolveProfileTemplateWithDefaults resolves p into a deterministic Substrate
+// ActorTemplate name and specification, falling back to defaultTaskImage (or
+// [v1alpha1.DefaultTaskImage] when empty) when p omits image.
+//
+// When p sets ate_actor_template, it returns that template name with a nil
+// *ateapipb.ActorTemplate so the caller looks up the existing user-managed
+// template on Substrate rather than creating an AX-managed template.
+func ResolveProfileTemplateWithDefaults(atespace string, p *v1alpha1.Profile, defaultTaskImage, runnerImage string) (string, *ateapipb.ActorTemplate, error) {
 	if atespace == "" {
 		atespace = v1alpha1.DefaultAtespace
 	}
@@ -109,7 +112,11 @@ func ResolveProfileTemplate(atespace string, p *v1alpha1.Profile, runnerImage st
 
 	image := p.GetImage()
 	if image == "" {
-		image = v1alpha1.DefaultTaskImage
+		if defaultTaskImage != "" {
+			image = defaultTaskImage
+		} else {
+			image = v1alpha1.DefaultTaskImage
+		}
 	}
 
 	cpuMillicores := substrate.DefaultCPUMillicores

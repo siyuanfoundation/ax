@@ -179,4 +179,14 @@ func TestResolveProfileTemplate(t *testing.T) {
 	if err != nil || directName != "gpu-base" || directTmpl != nil {
 		t.Fatalf("ResolveProfileTemplate(AteActorTemplate) = (%q, %v, %v), want (\"gpu-base\", nil, nil)", directName, directTmpl, err)
 	}
+
+	// ResolveProfileTemplateWithDefaults hashes custom defaultTaskImage identically
+	// to an explicit Profile.Image with that same digest.
+	nCustomDefault, _, err := controller.ResolveProfileTemplateWithDefaults("default", &v1alpha1.Profile{}, "img@sha256:abc", "runner@sha256:r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nCustomDefault != nOmitted {
+		t.Errorf("ResolveProfileTemplateWithDefaults(%q) != explicit image (%q)", nCustomDefault, nOmitted)
+	}
 }
