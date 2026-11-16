@@ -31,6 +31,7 @@ import (
 	"github.com/cenkalti/backoff/v5"
 	"github.com/google/ax/internal/resources"
 	"github.com/google/ax/pkg/apis/v1alpha1"
+	"github.com/google/uuid"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -260,11 +261,28 @@ func IsTransientError(err error) bool {
 	return false
 }
 
+type singleAttemptKey struct{}
+
+// WithSingleAttempt returns a derived context instructing [*Client] methods to
+// make a single outbound RPC attempt per call instead of running internal
+// exponential-backoff loops so queue-based reconcilers own retry scheduling.
+func WithSingleAttempt(ctx context.Context) context.Context {
+	return context.WithValue(ctx, singleAttemptKey{}, true)
+}
+
+func isSingleAttempt(ctx context.Context) bool {
+	v, _ := ctx.Value(singleAttemptKey{}).(bool)
+	return v
+}
+
 // retryOnCodes calls fn until it succeeds, returns an error whose gRPC code is not in
 // retryable, defaultRetryAttempts is exhausted, or ctx is done. Between attempts it
 // waits with jittered exponential backoff starting at defaultRetryInterval and
-// capped at maxRetryInterval.
+// capped at maxRetryInterval. When WithSingleAttempt(ctx) is set, fn runs once.
 func retryOnCodes(ctx context.Context, fn func() error, retryable ...codes.Code) error {
+	if isSingleAttempt(ctx) {
+		return fn()
+	}
 	b := backoff.NewExponentialBackOff()
 	b.InitialInterval = defaultRetryInterval
 	b.MaxInterval = maxRetryInterval
@@ -645,6 +663,122 @@ func (c *Client) suspendActor(ctx context.Context, atespace, actorName string, o
 	return nil
 }
 
+// SuspendActorSync synchronously checkpoints and suspends the specified actor,
+// returning the latest completed durable Snapshot.generation once durable
+// upload has finished. If the actor is already SUSPENDED while its durable
+// upload is still PENDING, single-attempt reconciler callers receive an
+// Unavailable error so the task queue backs off cleanly, while direct callers
+// poll GetActor until the upload completes.
+func (c *Client) SuspendActorSync(ctx context.Context, atespace, actorName string) (int32, error) {
+	req := &ateapipb.SuspendActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+		Options: &ateapipb.SuspendOptions{
+			Mode: ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS,
+		},
+	}
+	resp, err := callWithRetry(ctx, func() (*ateapipb.SuspendActorResponse, error) {
+		return c.control.SuspendActor(ctx, req)
+	}, codes.Aborted)
+	if err != nil {
+		return 0, fmt.Errorf("synchronously suspending actor %s/%s: %w", atespace, actorName, err)
+	}
+	actor := resp.GetActor()
+	if !HasPendingSnapshotUpload(actor) {
+		return LatestDurableSnapshotGeneration(actor), nil
+	}
+	if isSingleAttempt(ctx) {
+		return 0, status.Errorf(codes.Unavailable, "actor %s/%s snapshot upload is still pending", atespace, actorName)
+	}
+
+	var durableGen int32
+	waitErr := retryOnCodes(ctx, func() error {
+		cur, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{
+			Actor: &ateapipb.ObjectRef{Atespace: atespace, Name: actorName},
+		})
+		if getErr != nil {
+			return getErr
+		}
+		if cur.GetStatus().GetState() != ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+			return status.Errorf(codes.FailedPrecondition, "actor %s/%s left SUSPENDED state (%s) while waiting for durable upload",
+				atespace, actorName, cur.GetStatus().GetState())
+		}
+		if HasPendingSnapshotUpload(cur) {
+			return status.Errorf(codes.Unavailable, "actor %s/%s snapshot upload is still pending", atespace, actorName)
+		}
+		durableGen = LatestDurableSnapshotGeneration(cur)
+		return nil
+	}, codes.Unavailable)
+	if waitErr != nil {
+		return 0, fmt.Errorf("waiting for durable snapshot upload of actor %s/%s: %w", atespace, actorName, waitErr)
+	}
+	return durableGen, nil
+}
+
+// RevertActor rolls an actor back to its latest completed durable snapshot and
+// leaves it SUSPENDED. Calling RevertActor on an actor already SUSPENDED at its
+// durable snapshot is treated as an idempotent success.
+func (c *Client) RevertActor(ctx context.Context, atespace, actorName string) (int32, error) {
+	req := &ateapipb.RevertActorRequest{
+		Actor: &ateapipb.ObjectRef{
+			Atespace: atespace,
+			Name:     actorName,
+		},
+	}
+	resp, err := callWithRetry(ctx, func() (*ateapipb.RevertActorResponse, error) {
+		return c.control.RevertActor(ctx, req)
+	}, codes.Aborted)
+	if err == nil {
+		return LatestDurableSnapshotGeneration(resp.GetActor()), nil
+	}
+	if status.Code(err) == codes.FailedPrecondition {
+		existing, getErr := c.GetActor(ctx, atespace, actorName)
+		if getErr != nil {
+			return 0, fmt.Errorf("checking actor %s/%s after revert precondition failure: %w", atespace, actorName, getErr)
+		}
+		if existing.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+			if HasPendingSnapshotUpload(existing) {
+				return 0, status.Errorf(codes.Unavailable, "actor %s/%s snapshot upload is still pending", atespace, actorName)
+			}
+			return LatestDurableSnapshotGeneration(existing), nil
+		}
+	}
+	return 0, fmt.Errorf("reverting actor %s/%s: %w", atespace, actorName, err)
+}
+
+// LatestDurableSnapshotGeneration returns the highest generation among
+// COMPLETED durable snapshots recorded on actor, or 0 when the actor has none.
+func LatestDurableSnapshotGeneration(actor *ateapipb.Actor) int32 {
+	var maxGen int32
+	for _, snap := range actor.GetStatus().GetSnapshots() {
+		if snap.GetDurableSnapshot().GetState() == ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED &&
+			snap.GetGeneration() > maxGen {
+			maxGen = snap.GetGeneration()
+		}
+	}
+	return maxGen
+}
+
+// HasPendingSnapshotUpload reports whether actor holds any snapshot whose
+// upload to durable object storage has not yet completed.
+func HasPendingSnapshotUpload(actor *ateapipb.Actor) bool {
+	if actor == nil {
+		return false
+	}
+	for _, snap := range actor.GetStatus().GetSnapshots() {
+		state := snap.GetDurableSnapshot().GetState()
+		if state == ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING {
+			return true
+		}
+		if snap.GetLocality() != "" && state != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			return true
+		}
+	}
+	return false
+}
+
 // GetActor fetches an Actor by name.
 func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, error) {
 	req := &ateapipb.GetActorRequest{
@@ -725,20 +859,61 @@ func (c *Client) EnsureActorEgressPolicy(ctx context.Context, atespace, actorNam
 // DeleteActor deletes the specified actor from Substrate and blocks until the actor
 // is fully deleted.
 func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) error {
+	return c.DeleteActorWithUID(ctx, atespace, actorName, "")
+}
+
+// DeleteActorWithUID deletes the named actor only if its Metadata.Uid matches
+// expectedUID (when expectedUID is non-empty), returning nil immediately if the
+// expected actor incarnation is already gone or has been replaced by a
+// different UID.
+func (c *Client) DeleteActorWithUID(ctx context.Context, atespace, actorName, expectedUID string) error {
 	req := &ateapipb.DeleteActorRequest{
 		Actor: &ateapipb.ObjectRef{
 			Atespace: atespace,
 			Name:     actorName,
 		},
 	}
+	if expectedUID != "" {
+		if uuid.Validate(expectedUID) == nil {
+			req.Options = &ateapipb.DeleteOptions{Uid: expectedUID}
+		} else {
+			existing, getErr := c.GetActor(ctx, atespace, actorName)
+			if status.Code(getErr) == codes.NotFound {
+				return nil
+			}
+			if getErr != nil {
+				return fmt.Errorf("checking actor %s/%s before delete: %w", atespace, actorName, getErr)
+			}
+			if existing.GetMetadata().GetUid() != expectedUID {
+				return nil
+			}
+		}
+	}
+
+	var uidGone bool
 	_, err := callWithRetry(ctx, func() (*ateapipb.Actor, error) {
-		return c.control.DeleteActor(ctx, req)
+		res, delErr := c.control.DeleteActor(ctx, req)
+		if delErr != nil && expectedUID != "" && status.Code(delErr) == codes.Aborted {
+			cur, getErr := c.control.GetActor(ctx, &ateapipb.GetActorRequest{Actor: req.Actor})
+			if status.Code(getErr) == codes.NotFound {
+				uidGone = true
+				return nil, nil
+			}
+			if getErr == nil && cur.GetMetadata().GetUid() != "" && cur.GetMetadata().GetUid() != expectedUID {
+				uidGone = true
+				return nil, nil
+			}
+		}
+		return res, delErr
 	}, codes.Aborted)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			return nil
 		}
 		return fmt.Errorf("deleting actor %s/%s: %w", atespace, actorName, err)
+	}
+	if uidGone {
+		return nil
 	}
 
 	getReq := &ateapipb.GetActorRequest{
@@ -749,7 +924,7 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 	}
 
 	// Fast path: check if the actor was deleted synchronously.
-	_, err = c.control.GetActor(ctx, getReq)
+	cur, err := c.control.GetActor(ctx, getReq)
 	if err != nil {
 		if status.Code(err) == codes.NotFound {
 			return nil
@@ -757,6 +932,11 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 		if ctx.Err() != nil {
 			return fmt.Errorf("waiting for actor %s/%s deletion: %w", atespace, actorName, ctx.Err())
 		}
+	} else if expectedUID != "" && cur.GetMetadata().GetUid() != "" && cur.GetMetadata().GetUid() != expectedUID {
+		return nil
+	}
+	if isSingleAttempt(ctx) {
+		return status.Errorf(codes.Unavailable, "actor %s/%s is still deleting; please retry", atespace, actorName)
 	}
 
 	ticker := time.NewTicker(defaultRetryInterval)
@@ -767,7 +947,7 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 		case <-ctx.Done():
 			return fmt.Errorf("waiting for actor %s/%s deletion: %w", atespace, actorName, ctx.Err())
 		case <-ticker.C:
-			_, err := c.control.GetActor(ctx, getReq)
+			cur, err := c.control.GetActor(ctx, getReq)
 			if err != nil {
 				if status.Code(err) == codes.NotFound {
 					return nil
@@ -775,6 +955,8 @@ func (c *Client) DeleteActor(ctx context.Context, atespace, actorName string) er
 				if ctx.Err() != nil {
 					return fmt.Errorf("waiting for actor %s/%s deletion: %w", atespace, actorName, ctx.Err())
 				}
+			} else if expectedUID != "" && cur.GetMetadata().GetUid() != "" && cur.GetMetadata().GetUid() != expectedUID {
+				return nil
 			}
 		}
 	}
@@ -833,6 +1015,30 @@ func (c *Client) CreateTag(ctx context.Context, atespace, tagName, sourceActorNa
 		return nil, fmt.Errorf("creating tag %s/%s from actor %s: %w", atespace, tagName, sourceActorName, err)
 	}
 	return tag, nil
+}
+
+// EnsureSnapshotTag idempotently ensures that tagName exists in COMPLETED
+// durable snapshot state from sourceActorName, deleting and recreating an
+// incomplete prior attempt of the same tag if necessary.
+func (c *Client) EnsureSnapshotTag(ctx context.Context, atespace, tagName, sourceActorName string) (*ateapipb.Tag, error) {
+	existing, err := c.GetTag(ctx, atespace, tagName)
+	if err != nil && status.Code(err) != codes.NotFound {
+		return nil, err
+	}
+	if existing != nil {
+		sameSource := sourceActorName == "" || existing.GetSourceActor().GetName() == sourceActorName
+		completed := existing.GetMetadata().GetDeleteTime() == nil &&
+			existing.GetStatus().GetSnapshot().GetDurableSnapshot().GetState() == ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED
+		if completed && sameSource {
+			return existing, nil
+		}
+		if sameSource {
+			if delErr := c.DeleteTag(ctx, atespace, tagName); delErr != nil {
+				return nil, delErr
+			}
+		}
+	}
+	return c.CreateTag(ctx, atespace, tagName, sourceActorName)
 }
 
 // GetTag fetches a Tag by atespace and name.

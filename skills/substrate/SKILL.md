@@ -18,7 +18,7 @@ and `hack/setup-e2e-kind.sh` if they look stale.
 
 | Module | Pinned | Provides | Imported by |
 |---|---|---|---|
-| `go.ate.dev/substrate` | `v1.0.0` | Control API protos `api/ateapi/v1` (atespaces, actor templates, actors, tags, snapshot fidelity, suspend/resume, egress rules) | `internal/substrate`, `internal/substrate/substratetest`, `internal/lifecycle`, `internal/store`, `internal/server`, `internal/controller`, `internal/apivalidation`, `test/e2e`, `pkg/apis/v1alpha1` (its `.proto` files import `ateapi.proto`) |
+| `go.ate.dev/substrate` | `v1.0.0` | Control API protos `api/ateapi/v1` (atespaces, actor templates, actors, tags, snapshot fidelity, suspend/resume, egress rules) | `internal/substrate`, `internal/substrate/substratetest`, `internal/lifecycle`, `internal/reconciler`, `internal/store`, `internal/store/postgres`, `internal/server`, `internal/controller`, `internal/apivalidation`, `test/e2e`, `pkg/apis/v1alpha1` (its `.proto` files import `ateapi.proto`) |
 | `github.com/agent-substrate/env` | `v0.0.11-0.20260912052224-4468a200b170` (pseudo-version) | Guest services served inside the sandbox (process exec + file system gRPC) and `proto/ateenv/v1alpha` | `internal/guest`, `internal/metadata` |
 
 There is no `replace` directive for either module. Local hacking against a
@@ -35,23 +35,28 @@ All Control API traffic goes through this package. It encapsulates:
   token with audience `api.ate-system.svc`, see `deploy/ax-server.yaml`), CA
   from `SUBSTRATE_CA_FILE`.
 - **Retry** — `IsTransientError` (`Unavailable`, `DeadlineExceeded`, `Aborted`) + `callWithRetry` (`retryOnCodes`).
-- **Helpers** the reconcilers rely on — `EnsureAtespace`, `EnsureActorTemplate`,
-  `EnsureActorTemplateWithImage`, `BuildActorTemplate`, `EnsureActor`,
-  `EnsureActorFromTag`, `GetActorEgressPolicy`, `EnsureActorEgressPolicy`,
-  `CreateTag`, `GetTag`, `ListTags`, `DeleteTag`, `SuspendActor`,
-  `SuspendActorAndWaitForSnapshot`, `ResumeActor`, `DeleteActor`, `WorkerIP`,
+- **Helpers** the reconcilers rely on — `WithSingleAttempt`,
+  `EnsureAtespace`, `EnsureActorTemplate`, `EnsureActorTemplateWithImage`,
+  `BuildActorTemplate`, `EnsureActor`, `EnsureActorFromTag`,
+  `GetActorEgressPolicy`, `EnsureActorEgressPolicy`, `CreateTag`,
+  `EnsureSnapshotTag`, `GetTag`, `ListTags`, `DeleteTag`, `ListActors`,
+  `SuspendActor`, `SuspendActorAndWaitForSnapshot`, `SuspendActorSync`,
+  `ResumeActor`, `RevertActor`, `DeleteActor`, `DeleteActorWithUID`,
+  `LatestDurableSnapshotGeneration`, `HasPendingSnapshotUpload`, `WorkerIP`,
   `ResourceLimits`.
 
 ### Where a new Control API call lives today
 
 - `internal/substrate/client.go` is the only non-test file that calls
   `ateapipb.NewControlClient`; every existing RPC is a method on `*Client`,
-  wrapped in `callWithRetry` (`codes.Unavailable` plus optional codes such as `codes.Aborted`).
+  wrapped in `callWithRetry` (`codes.Unavailable` plus optional codes such as
+  `codes.Aborted`), with `WithSingleAttempt(ctx)` disabling internal retry loops
+  when called by `internal/reconciler` so the task queue owns retry scheduling.
 - Each method has a table-driven case in `client_test.go` (`mockControlClient`).
 - Callers in `internal/controller` exercise it through `mockControlServer`
   (`reconciler_test.go`) or `internal/substrate/substratetest` (`workspace_test.go`);
-  `internal/server` and `cmd/ax` tests also use `internal/substrate/substratetest`
-  (section 4).
+  `internal/reconciler`, `internal/server`, and `cmd/ax` tests also use
+  `internal/substrate/substratetest` (section 4).
 
 ## 3. Address contract
 
@@ -83,9 +88,12 @@ ateapipb.RegisterControlServer(grpcServer, mockSrv)
 // serve on a listener, point substrate.NewClient at it
 ```
 
-Canonical examples: `internal/controller/reconciler_test.go` (reconciler state
-transitions; the largest test file in the repo). `internal/server/server_test.go`
-and `cmd/ax/main_test.go` run a real `TaskReconciler` against
+Canonical examples: `internal/controller/reconciler_test.go` (legacy reconciler
+state transitions), `internal/reconciler/reconciler_test.go` (leased action
+queue reconciler), and `internal/reconciler/reconciler_postgres_test.go`
+(isolated-schema PostgreSQL + `substratetest` integration tests, gated on
+`AX_TEST_POSTGRES_URL`). `internal/reconciler/reconciler_test.go`,
+`internal/server/server_test.go`, and `cmd/ax/main_test.go` run against
 `internal/substrate/substratetest`, an in-memory fake of the same API (atespaces,
 actor templates, actors, and tags).
 `internal/substrate/client_test.go` uses a client-side `mockControlClient`

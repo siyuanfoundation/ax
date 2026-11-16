@@ -116,7 +116,7 @@ type Action struct {
 	// Action (zero means runnable immediately). Set to now + backoff on
 	// capacity/transient retries or spec.retry crash-recovery delays;
 	// NextReconcileAt schedules the row for max(now, Actions[0].NotBefore).
-	NotBefore time.Time `json:"notBefore,omitempty"`
+	NotBefore time.Time `json:"notBefore,omitzero"`
 }
 
 // State bundles the Task resource together with the control-plane runtime
@@ -375,14 +375,18 @@ type CapacityUnavailableInput struct {
 func (*CapacityUnavailableInput) isInput() {}
 
 // ObservedActorInput reports actor state drift observed by the periodic sweep
-// (or FAILED_PRECONDITION when suspending a crashed actor).
+// (or FAILED_PRECONDITION / pre-check observations when SUSPEND_ACTOR_SYNC
+// encounters a crashed actor in any task state, including COMPLETED, FAILED, or
+// IDLE).
 //
 // Observations are level-triggered: the sweep reports the same drift on every
 // pass until Substrate converges. Transition is therefore idempotent for a
 // repeated observation: it does not consume another retry for a crash whose
 // REVERT_ACTOR is still pending, does not replace an equivalent pending action
 // (which would change the head action ID that workers fence completions on),
-// and ignores MissingConfirmed until CREATE_ACTOR has completed.
+// replaces or clears a head SUSPEND_ACTOR_SYNC when ActorState is
+// ACTOR_STATE_CRASHED, and ignores MissingConfirmed until CREATE_ACTOR has
+// completed.
 type ObservedActorInput struct {
 	// ActorState is the live ActorState observed on Substrate (ignored when
 	// MissingConfirmed is true).

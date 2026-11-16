@@ -54,13 +54,32 @@ type mockControlClient struct {
 	deleteTagErrs       []error
 	deleteTagCalls      int
 	suspendCalls        []*ateapipb.SuspendActorRequest
+	suspendResp         *ateapipb.SuspendActorResponse
+	revertErr           error
+	revertResp          *ateapipb.RevertActorResponse
+	getActorOverride    *ateapipb.Actor
 }
 
 func (m *mockControlClient) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest, opts ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.suspendCalls = append(m.suspendCalls, req)
+	if m.suspendResp != nil {
+		return m.suspendResp, nil
+	}
 	return &ateapipb.SuspendActorResponse{}, nil
+}
+
+func (m *mockControlClient) RevertActor(ctx context.Context, req *ateapipb.RevertActorRequest, opts ...grpc.CallOption) (*ateapipb.RevertActorResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.revertErr != nil {
+		return nil, m.revertErr
+	}
+	if m.revertResp != nil {
+		return m.revertResp, nil
+	}
+	return &ateapipb.RevertActorResponse{}, nil
 }
 
 func (m *mockControlClient) CreateActorEgressPolicy(ctx context.Context, req *ateapipb.CreateActorEgressPolicyRequest, opts ...grpc.CallOption) (*ateapipb.EgressPolicy, error) {
@@ -145,6 +164,9 @@ func (m *mockControlClient) GetActor(ctx context.Context, req *ateapipb.GetActor
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getCalls = append(m.getCalls, req)
+	if m.getActorOverride != nil {
+		return m.getActorOverride, nil
+	}
 	if m.actorRemaining > 0 {
 		m.actorRemaining--
 		return &ateapipb.Actor{
@@ -786,5 +808,78 @@ func TestClient_EnsureActorEgressPolicy_RetriesAborted(t *testing.T) {
 	}
 	if mock.createPolicyCalls != 2 {
 		t.Errorf("createPolicyCalls = %d, want 2", mock.createPolicyCalls)
+	}
+}
+
+func TestClient_ReconcilerHelpers(t *testing.T) {
+	ctx := t.Context()
+
+	// 1. SuspendActorSync returns Unavailable under WithSingleAttempt while upload is pending.
+	cPending := &Client{control: &mockControlClient{
+		suspendResp: &ateapipb.SuspendActorResponse{
+			Actor: &ateapipb.Actor{
+				Status: &ateapipb.ActorStatus{
+					State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+					Snapshots: []*ateapipb.Snapshot{{
+						Generation:      3,
+						DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING},
+					}},
+				},
+			},
+		},
+	}}
+	if _, err := cPending.SuspendActorSync(WithSingleAttempt(ctx), "default", "a1"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("SuspendActorSync(pending, single attempt) = %v, want Unavailable", err)
+	}
+
+	// 2. RevertActor treats FailedPrecondition on already-suspended durable actor as success.
+	cRevert := &Client{control: &mockControlClient{
+		revertErr: status.Error(codes.FailedPrecondition, "already suspended"),
+		getActorOverride: &ateapipb.Actor{
+			Status: &ateapipb.ActorStatus{
+				State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+				Snapshots: []*ateapipb.Snapshot{{
+					Generation:      4,
+					DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED},
+				}},
+			},
+		},
+	}}
+	if gen, err := cRevert.RevertActor(ctx, "default", "a1"); err != nil || gen != 4 {
+		t.Fatalf("RevertActor(idempotent) = (%d, %v), want (4, nil)", gen, err)
+	}
+
+	// 3. DeleteActorWithUID skips deletion when live actor has a different UID.
+	mockDel := &mockControlClient{
+		getActorOverride: &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: "default", Name: "a1", Uid: "other-uid"},
+		},
+	}
+	if err := (&Client{control: mockDel}).DeleteActorWithUID(ctx, "default", "a1", "expected-uid"); err != nil {
+		t.Fatalf("DeleteActorWithUID(mismatched UID) = %v, want nil", err)
+	}
+	if len(mockDel.deleteCalls) != 0 {
+		t.Fatalf("DeleteActorWithUID deleted foreign actor: %+v", mockDel.deleteCalls)
+	}
+
+	// 4. EnsureSnapshotTag recreates an incomplete tag.
+	mockTag := &mockControlClient{
+		tags: map[string]*ateapipb.Tag{
+			"default/t-pending": {
+				Metadata:    &ateapipb.ResourceMetadata{Atespace: "default", Name: "t-pending"},
+				SourceActor: &ateapipb.ObjectRef{Atespace: "default", Name: "a1"},
+				Status: &ateapipb.TagStatus{
+					Snapshot: &ateapipb.Snapshot{
+						DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING},
+					},
+				},
+			},
+		},
+	}
+	if tag, err := (&Client{control: mockTag}).EnsureSnapshotTag(ctx, "default", "t-pending", "a1"); err != nil || tag.GetMetadata().GetName() != "t-pending" {
+		t.Fatalf("EnsureSnapshotTag(recreate pending) = (%v, %v)", tag, err)
+	}
+	if mockTag.deleteTagCalls != 1 {
+		t.Fatalf("deleteTagCalls = %d, want 1", mockTag.deleteTagCalls)
 	}
 }

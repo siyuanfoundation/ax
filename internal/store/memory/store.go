@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
+	"github.com/google/ax/internal/lifecycle"
 	"github.com/google/ax/internal/store"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"google.golang.org/protobuf/proto"
@@ -29,6 +31,19 @@ import (
 
 const defaultPageLimit = 50
 
+// Option configures a [MemoryStore].
+type Option func(*MemoryStore)
+
+// WithClock overrides the clock used by [MemoryStore] for deterministic testing
+// of queue leases, watchdogs, and retry backoffs.
+func WithClock(clock func() time.Time) Option {
+	return func(s *MemoryStore) {
+		if clock != nil {
+			s.clock = clock
+		}
+	}
+}
+
 // clone returns a deep copy of a protobuf message so stored resources are never
 // shared with callers. Copying the struct by value is unsafe: generated messages
 // embed internal state, including a mutex.
@@ -36,23 +51,44 @@ func clone[T proto.Message](m T) T {
 	return proto.Clone(m).(T)
 }
 
-// MemoryStore is an in-memory implementation of store.Store for testing and single-node setups.
+// MemoryStore is an in-memory implementation of store.Store and store.TaskQueue
+// for testing and single-node setups.
 type MemoryStore struct {
 	mu         sync.RWMutex
-	tasks      map[string]*v1alpha1.Task
+	tasks      map[string]*store.TaskRow
 	models     map[string]*v1alpha1.Model
 	workspaces map[string]*v1alpha1.Workspace
 	gateways   map[string]*v1alpha1.Gateway
+	clock      func() time.Time
+
+	wakeupMu sync.RWMutex
+	wakeup   func()
 }
 
+var (
+	_ store.Store     = (*MemoryStore)(nil)
+	_ store.TaskQueue = (*MemoryStore)(nil)
+)
+
 // NewStore creates a new in-memory Store.
-func NewStore() *MemoryStore {
-	return &MemoryStore{
-		tasks:      make(map[string]*v1alpha1.Task),
+func NewStore(opts ...Option) *MemoryStore {
+	s := &MemoryStore{
+		tasks:      make(map[string]*store.TaskRow),
 		models:     make(map[string]*v1alpha1.Model),
 		workspaces: make(map[string]*v1alpha1.Workspace),
 		gateways:   make(map[string]*v1alpha1.Gateway),
+		clock:      time.Now,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
+	return s
+}
+
+func (s *MemoryStore) now() time.Time {
+	return s.clock().UTC()
 }
 
 // sortByKey orders resources by atespace and name, so that lists, and pages
@@ -117,7 +153,18 @@ func (s *MemoryStore) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	key := taskKey(task.Metadata.Atespace, task.Metadata.Name)
 
 	s.mu.Lock()
-	s.tasks[key] = clone(task)
+	cp := clone(task)
+	if existing, ok := s.tasks[key]; ok {
+		existing.Task = cp
+		if cp.Status.Generation > existing.Generation {
+			existing.Generation = cp.Status.Generation
+		}
+	} else {
+		s.tasks[key] = &store.TaskRow{
+			State:      lifecycle.State{Task: cp},
+			Generation: cp.Status.Generation,
+		}
+	}
 	s.mu.Unlock()
 
 	return nil
@@ -127,13 +174,11 @@ func (s *MemoryStore) GetTask(ctx context.Context, atespace, name string) (*v1al
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	key := taskKey(atespace, name)
-	t, ok := s.tasks[key]
-	if !ok {
+	row, ok := s.tasks[taskKey(atespace, name)]
+	if !ok || row.Task == nil {
 		return nil, store.ErrNotFound
 	}
-	cp := clone(t)
-	return cp, nil
+	return clone(row.Task), nil
 }
 
 func (s *MemoryStore) ListTasks(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Task, error) {
@@ -141,10 +186,13 @@ func (s *MemoryStore) ListTasks(ctx context.Context, atespace string, limit, off
 	defer s.mu.RUnlock()
 
 	var result []*v1alpha1.Task
-	for _, t := range s.tasks {
+	for _, row := range s.tasks {
+		if row == nil || row.Task == nil {
+			continue
+		}
+		t := row.Task
 		if atespace == "" || atespace == "*" || t.Metadata.Atespace == atespace {
-			cp := clone(t)
-			result = append(result, cp)
+			result = append(result, clone(t))
 		}
 	}
 	sortByKey(result)
@@ -152,36 +200,35 @@ func (s *MemoryStore) ListTasks(ctx context.Context, atespace string, limit, off
 }
 
 func (s *MemoryStore) UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error {
-	key := taskKey(atespace, name)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	t, ok := s.tasks[key]
-	if !ok {
+	row, ok := s.tasks[taskKey(atespace, name)]
+	if !ok || row.Task == nil {
 		return store.ErrNotFound
 	}
-	t.Status = clone(status)
+	row.Task.Status = clone(status)
+	if row.Task.Status != nil && row.Task.Status.Generation > row.Generation {
+		row.Generation = row.Task.Status.Generation
+	}
 	return nil
 }
 
 func (s *MemoryStore) SetTaskDeleteTime(ctx context.Context, atespace, name string, deleteTime *timestamppb.Timestamp) error {
-	key := taskKey(atespace, name)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	t, ok := s.tasks[key]
-	if !ok {
+	row, ok := s.tasks[taskKey(atespace, name)]
+	if !ok || row.Task == nil {
 		return store.ErrNotFound
 	}
-	if t.Metadata == nil {
-		t.Metadata = &v1alpha1.ObjectMeta{}
+	if row.Task.Metadata == nil {
+		row.Task.Metadata = &v1alpha1.ObjectMeta{}
 	}
 	if deleteTime != nil {
-		t.Metadata.DeleteTime = clone(deleteTime)
+		row.Task.Metadata.DeleteTime = clone(deleteTime)
 	} else {
-		t.Metadata.DeleteTime = nil
+		row.Task.Metadata.DeleteTime = nil
 	}
 	return nil
 }
@@ -211,8 +258,7 @@ func (s *MemoryStore) SaveModel(ctx context.Context, model *v1alpha1.Model) erro
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp := clone(model)
-	s.models[metaKey(model.Metadata)] = cp
+	s.models[metaKey(model.Metadata)] = clone(model)
 	return nil
 }
 
@@ -224,8 +270,7 @@ func (s *MemoryStore) GetModel(ctx context.Context, atespace, name string) (*v1a
 	if !ok {
 		return nil, store.ErrNotFound
 	}
-	cp := clone(m)
-	return cp, nil
+	return clone(m), nil
 }
 
 func (s *MemoryStore) ListModels(ctx context.Context, atespace string) ([]*v1alpha1.Model, error) {
@@ -235,8 +280,7 @@ func (s *MemoryStore) ListModels(ctx context.Context, atespace string) ([]*v1alp
 	var result []*v1alpha1.Model
 	for _, m := range s.models {
 		if atespace == "" || atespace == "*" || m.Metadata.Atespace == atespace {
-			cp := clone(m)
-			result = append(result, cp)
+			result = append(result, clone(m))
 		}
 	}
 	sortByKey(result)
@@ -246,7 +290,6 @@ func (s *MemoryStore) ListModels(ctx context.Context, atespace string) ([]*v1alp
 func (s *MemoryStore) DeleteModel(ctx context.Context, atespace, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	delete(s.models, taskKey(atespace, name))
 	return nil
 }
@@ -269,8 +312,7 @@ func (s *MemoryStore) SaveWorkspace(ctx context.Context, ws *v1alpha1.Workspace)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp := clone(ws)
-	s.workspaces[metaKey(ws.Metadata)] = cp
+	s.workspaces[metaKey(ws.Metadata)] = clone(ws)
 	return nil
 }
 
@@ -282,8 +324,7 @@ func (s *MemoryStore) GetWorkspace(ctx context.Context, atespace, name string) (
 	if !ok {
 		return nil, store.ErrNotFound
 	}
-	cp := clone(ws)
-	return cp, nil
+	return clone(ws), nil
 }
 
 func (s *MemoryStore) ListWorkspaces(ctx context.Context, atespace string, limit, offset int64) ([]*v1alpha1.Workspace, error) {
@@ -293,8 +334,7 @@ func (s *MemoryStore) ListWorkspaces(ctx context.Context, atespace string, limit
 	var result []*v1alpha1.Workspace
 	for _, w := range s.workspaces {
 		if atespace == "" || atespace == "*" || w.Metadata.Atespace == atespace {
-			cp := clone(w)
-			result = append(result, cp)
+			result = append(result, clone(w))
 		}
 	}
 	sortByKey(result)
@@ -302,12 +342,10 @@ func (s *MemoryStore) ListWorkspaces(ctx context.Context, atespace string, limit
 }
 
 func (s *MemoryStore) UpdateWorkspaceStatus(ctx context.Context, atespace, name string, status *v1alpha1.WorkspaceStatus) error {
-	key := taskKey(atespace, name)
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	ws, ok := s.workspaces[key]
+	ws, ok := s.workspaces[taskKey(atespace, name)]
 	if !ok {
 		return store.ErrNotFound
 	}
@@ -318,7 +356,6 @@ func (s *MemoryStore) UpdateWorkspaceStatus(ctx context.Context, atespace, name 
 func (s *MemoryStore) DeleteWorkspace(ctx context.Context, atespace, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	delete(s.workspaces, taskKey(atespace, name))
 	return nil
 }
@@ -341,8 +378,7 @@ func (s *MemoryStore) SaveGateway(ctx context.Context, gw *v1alpha1.Gateway) err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	cp := clone(gw)
-	s.gateways[metaKey(gw.Metadata)] = cp
+	s.gateways[metaKey(gw.Metadata)] = clone(gw)
 	return nil
 }
 
@@ -354,8 +390,7 @@ func (s *MemoryStore) GetGateway(ctx context.Context, atespace, name string) (*v
 	if !ok {
 		return nil, store.ErrNotFound
 	}
-	cp := clone(gw)
-	return cp, nil
+	return clone(gw), nil
 }
 
 func (s *MemoryStore) ListGateways(ctx context.Context, atespace string) ([]*v1alpha1.Gateway, error) {
@@ -365,8 +400,7 @@ func (s *MemoryStore) ListGateways(ctx context.Context, atespace string) ([]*v1a
 	var result []*v1alpha1.Gateway
 	for _, gw := range s.gateways {
 		if atespace == "" || atespace == "*" || gw.Metadata.Atespace == atespace {
-			cp := clone(gw)
-			result = append(result, cp)
+			result = append(result, clone(gw))
 		}
 	}
 	sortByKey(result)
@@ -376,7 +410,6 @@ func (s *MemoryStore) ListGateways(ctx context.Context, atespace string) ([]*v1a
 func (s *MemoryStore) DeleteGateway(ctx context.Context, atespace, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	delete(s.gateways, taskKey(atespace, name))
 	return nil
 }
