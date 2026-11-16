@@ -461,8 +461,8 @@ func TestPostgres_LeaseTaskPostLockClockAndLeaseExpiryTakeover(t *testing.T) {
 			ltContend, isContend, retryContend, err)
 	}
 
-	// Verify ExcludeOtherActionKinds skips unbucketed runnable actions (e.g.
-	// ENSURE_TEMPLATE) while admitting explicitly bucketed actions (RESUME_ACTOR).
+	// Verify RestrictActionKinds skips non-allowed runnable actions (e.g.
+	// ENSURE_TEMPLATE) while admitting AllowedActionKinds (RESUME_ACTOR).
 	otherKey := store.TaskKey{Atespace: "tenant-other", Name: "other-kind"}
 	if _, err := s.Apply(ctx, otherKey, func(_ *store.TaskRow, ts time.Time) (*store.TaskRow, error) {
 		st := lifecycle.State{
@@ -476,10 +476,10 @@ func TestPostgres_LeaseTaskPostLockClockAndLeaseExpiryTakeover(t *testing.T) {
 		t.Fatalf("Apply(otherKey): %v", err)
 	}
 	otherFiltered, err := s.LeaseDue(ctx, "w-other-filter", 30*time.Second, 10, store.LeaseFilter{
-		ExcludeOtherActionKinds: true,
-		BucketedActionKinds:     []lifecycle.ActionKind{lifecycle.ActionResumeActor},
+		RestrictActionKinds: true,
+		AllowedActionKinds:  []lifecycle.ActionKind{lifecycle.ActionResumeActor},
 	})
 	if err != nil || len(otherFiltered) != 1 || otherFiltered[0].Key != key {
-		t.Fatalf("LeaseDue(ExcludeOtherActionKinds) = %+v, %v; want only %v", otherFiltered, err, key)
+		t.Fatalf("LeaseDue(RestrictActionKinds) = %+v, %v; want only %v", otherFiltered, err, key)
 	}
 }

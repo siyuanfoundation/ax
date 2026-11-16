@@ -127,8 +127,8 @@ func (a *admissionController) ReleaseTaskSlots(n int) (wasAtCapacity bool) {
 	return wasAtCapacity
 }
 
-// LeaseFilter returns a [store.LeaseFilter] capturing both saturated atespaces
-// and saturated per-action-kind buckets on this replica so LeaseDue skips them
+// LeaseFilter returns a [store.LeaseFilter] capturing saturated atespaces and
+// saturated per-action-kind limits on this replica so LeaseDue skips them
 // directly during the store scan instead of causing head-of-line blocking or
 // lease-release churn.
 func (a *admissionController) LeaseFilter() store.LeaseFilter {
@@ -141,20 +141,23 @@ func (a *admissionController) LeaseFilter() store.LeaseFilter {
 			f.ExcludeAtespaces = append(f.ExcludeAtespaces, ns)
 		}
 	}
+	if a.inFlightKind[otherKindKey] >= a.otherKindLimit {
+		// The shared fallback pool is full: only action kinds with their own
+		// dedicated limit that still have free capacity can be admitted.
+		f.RestrictActionKinds = true
+		for kind, limit := range a.kindLimits {
+			if limit > 0 && a.inFlightKind[kind] < limit {
+				f.AllowedActionKinds = append(f.AllowedActionKinds, kind)
+			}
+		}
+		return f
+	}
 	for kind, limit := range a.kindLimits {
 		if limit <= 0 {
 			continue
 		}
 		if a.inFlightKind[kind] >= limit {
 			f.ExcludeActionKinds = append(f.ExcludeActionKinds, kind)
-		}
-	}
-	if a.inFlightKind[otherKindKey] >= a.otherKindLimit {
-		f.ExcludeOtherActionKinds = true
-		for kind, limit := range a.kindLimits {
-			if limit > 0 {
-				f.BucketedActionKinds = append(f.BucketedActionKinds, kind)
-			}
 		}
 	}
 	return f

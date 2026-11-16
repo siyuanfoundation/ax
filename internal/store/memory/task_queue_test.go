@@ -246,8 +246,8 @@ func TestMemoryStore_ApplyAndLeaseSemantics(t *testing.T) {
 			ltTimer, contendedTimer, retryTimer, err)
 	}
 
-	// Verify ExcludeOtherActionKinds skips unbucketed runnable actions (e.g.
-	// ENSURE_TEMPLATE) while admitting explicitly bucketed actions (RESUME_ACTOR).
+	// Verify RestrictActionKinds skips non-allowed runnable actions (e.g.
+	// ENSURE_TEMPLATE) while admitting AllowedActionKinds (RESUME_ACTOR).
 	kOther := store.TaskKey{Atespace: "tenant-c", Name: "other-kind-task"}
 	if _, err := s.Apply(ctx, kOther, func(_ *store.TaskRow, ts time.Time) (*store.TaskRow, error) {
 		st := lifecycle.State{
@@ -261,11 +261,11 @@ func TestMemoryStore_ApplyAndLeaseSemantics(t *testing.T) {
 		t.Fatalf("Apply(kOther): %v", err)
 	}
 	otherFiltered, err := s.LeaseDue(ctx, "w-other", 30*time.Second, 10, store.LeaseFilter{
-		ExcludeOtherActionKinds: true,
-		BucketedActionKinds:     []lifecycle.ActionKind{lifecycle.ActionResumeActor},
+		RestrictActionKinds: true,
+		AllowedActionKinds:  []lifecycle.ActionKind{lifecycle.ActionResumeActor},
 	})
 	if err != nil || len(otherFiltered) != 1 || otherFiltered[0].Key != k2 {
-		t.Fatalf("LeaseDue(ExcludeOtherActionKinds) = %+v, %v; want only %v", otherFiltered, err, k2)
+		t.Fatalf("LeaseDue(RestrictActionKinds) = %+v, %v; want only %v", otherFiltered, err, k2)
 	}
 
 	// No-op Apply after lease expiration scrubs expired LeaseOwner / LeaseExpiresAt on returned row.

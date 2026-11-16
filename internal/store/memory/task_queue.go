@@ -193,11 +193,11 @@ func (s *MemoryStore) LeaseDue(ctx context.Context, workerID string, leaseTTL ti
 			excludedKinds[k] = struct{}{}
 		}
 	}
-	var bucketedKinds map[lifecycle.ActionKind]struct{}
-	if filter.ExcludeOtherActionKinds {
-		bucketedKinds = make(map[lifecycle.ActionKind]struct{}, len(filter.BucketedActionKinds))
-		for _, k := range filter.BucketedActionKinds {
-			bucketedKinds[k] = struct{}{}
+	var allowedKinds map[lifecycle.ActionKind]struct{}
+	if filter.RestrictActionKinds {
+		allowedKinds = make(map[lifecycle.ActionKind]struct{}, len(filter.AllowedActionKinds))
+		for _, k := range filter.AllowedActionKinds {
+			allowedKinds[k] = struct{}{}
 		}
 	}
 
@@ -227,8 +227,8 @@ func (s *MemoryStore) LeaseDue(ctx context.Context, workerID string, leaseTTL ti
 			if _, skip := excludedKinds[headKind]; skip {
 				continue
 			}
-			if filter.ExcludeOtherActionKinds {
-				if _, explicit := bucketedKinds[headKind]; !explicit {
+			if filter.RestrictActionKinds {
+				if _, allowed := allowedKinds[headKind]; !allowed {
 					continue
 				}
 			}

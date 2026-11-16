@@ -763,9 +763,9 @@ func (s *Store) LeaseDue(ctx context.Context, workerID string, leaseTTL time.Dur
 	for _, k := range filter.ExcludeActionKinds {
 		excludedKinds = append(excludedKinds, string(k))
 	}
-	bucketedKinds := make([]string, 0, len(filter.BucketedActionKinds))
-	for _, k := range filter.BucketedActionKinds {
-		bucketedKinds = append(bucketedKinds, string(k))
+	allowedKinds := make([]string, 0, len(filter.AllowedActionKinds))
+	for _, k := range filter.AllowedActionKinds {
+		allowedKinds = append(allowedKinds, string(k))
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -814,7 +814,7 @@ func (s *Store) LeaseDue(ctx context.Context, workerID string, leaseTTL time.Dur
 		) AS due
 		WHERE t.atespace = due.atespace AND t.name = due.name
 		RETURNING `+qualifiedTaskRowColumns("t"),
-		now, limit, workerID, exp, excludedAtespaces, excludedKinds, filter.ExcludeOtherActionKinds, bucketedKinds,
+		now, limit, workerID, exp, excludedAtespaces, excludedKinds, filter.RestrictActionKinds, allowedKinds,
 	)
 	if err != nil {
 		return nil, classifyTxError(ctx, err)

@@ -23,9 +23,10 @@
 // Apply dropped or replaced the head action), and commits results through
 // [store.TaskApplier.Apply] fenced on both the lease token and head Action.ID.
 //
-// For M0 rollouts and operational fallback (--reconcile-mode=inline),
-// [Reconciler.ReconcileInline] runs the identical leased action executor
-// synchronously from request handlers without background polling.
+// [ModeQueue] is the production operating mode. [ModeInline]
+// ([Reconciler.ReconcileInline]) disables background polling for deterministic
+// unit/integration tests and transitional synchronous handler bring-up before
+// background queue workers are wired into ax-server.
 //
 // Alongside action execution, [Sweeper] runs a sharded background actor drift
 // sweep against Substrate's ListActors API and watermark-gated lost-runner
@@ -59,16 +60,27 @@ import (
 type Mode string
 
 const (
-	// ModeQueue runs background polling workers that lease and execute due task
-	// actions asynchronously.
+	// ModeQueue (production default) runs background polling workers in
+	// [Reconciler.Run] that lease and execute due task actions, backoffs,
+	// drift-sweep repairs, and lifecycle timers (such as ClaimDeadline)
+	// asynchronously outside request handlers.
 	ModeQueue Mode = "queue"
-	// ModeInline disables background polling so callers drive queued task
-	// actions synchronously after store.Apply via ReconcileInline. Transient
-	// action backoffs (up to MaxBackoff) are waited out under the caller's
-	// context against an advancing store clock, while capacity-unavailable
-	// backoffs and future lifecycle timers (such as ClaimDeadline) remain
-	// persisted on the task row until due on a subsequent ReconcileInline call
-	// or ModeQueue poller.
+	// ModeInline disables background polling so callers drive a single task's
+	// runnable actions synchronously after store.Apply via
+	// [Reconciler.ReconcileInline].
+	//
+	// When ModeInline is used:
+	//   - Deterministic unit and integration tests (often paired with a fake
+	//     store clock) that step individual tasks without background worker
+	//     goroutines racing assertions.
+	//   - Transitional synchronous bring-up while migrating RPC handlers onto
+	//     store.Apply + lifecycle.TransitionFunc before background queue
+	//     workers are wired into ax-server.
+	//
+	// ModeInline is not a production runtime mode or operational rollback
+	// switch: without a background poller, deferred work that outlives a
+	// request (ClaimDeadline watchdogs, capacity backoffs, and actions enqueued
+	// by the background actor drift sweep) remains parked on the task row.
 	ModeInline Mode = "inline"
 )
 
@@ -120,7 +132,8 @@ type WorkspaceTagResolver func(ctx context.Context, atespace, workspaceName, tem
 
 // Config configures a [Reconciler]. Zero values use production defaults.
 type Config struct {
-	// Mode selects ModeQueue (default) or ModeInline.
+	// Mode selects ModeQueue (production default) or ModeInline (tests and
+	// synchronous handler bring-up; see [ModeInline]).
 	Mode Mode
 	// WorkerID identifies this replica in task lease tokens (defaults to
 	// "<hostname>-<short-uuid>").
@@ -715,12 +728,16 @@ func (r *Reconciler) pollOnce(ctx context.Context) {
 	}
 }
 
-// ReconcileInline synchronously executes runnable actions on key under a
-// per-row worker lease. It is used when ax-server runs with
-// --reconcile-mode=inline and shares the same fencing, renewal, and error
-// handling as ModeQueue workers. If admission control, a concurrent lease, or a
-// short action backoff (<= MaxBackoff on an advancing store clock) temporarily
-// defers execution, ReconcileInline waits and retries under ctx.
+// ReconcileInline synchronously leases key and executes its currently runnable
+// actions on the caller's goroutine, sharing the same row-lease fencing,
+// renewal, admission limits, and error classification as ModeQueue workers.
+//
+// Callers use ReconcileInline in ModeInline for deterministic tests and
+// synchronous handler bring-up (see [ModeInline]). If admission control, a
+// concurrent lease, or a short transient action backoff (<= MaxBackoff on an
+// advancing store clock) temporarily defers execution, ReconcileInline waits
+// and retries under ctx; longer deferrals (capacity backoffs and future
+// lifecycle timers) remain persisted on the task row.
 func (r *Reconciler) ReconcileInline(ctx context.Context, key store.TaskKey) error {
 	key = key.Normalized()
 	var sleptBackoff time.Duration

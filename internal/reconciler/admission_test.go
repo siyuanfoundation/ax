@@ -53,21 +53,27 @@ func TestAdmissionController_TaskAtespaceAndKindLimits(t *testing.T) {
 	}
 	if f := ac.LeaseFilter(); len(f.ExcludeAtespaces) != 1 || f.ExcludeAtespaces[0] != "tenant-a" ||
 		len(f.ExcludeActionKinds) != 1 || f.ExcludeActionKinds[0] != lifecycle.ActionResumeActor ||
-		f.ExcludeOtherActionKinds {
-		t.Fatalf("LeaseFilter() = %+v, want ExcludeAtespaces=[tenant-a], ExcludeActionKinds=[RESUME_ACTOR], ExcludeOtherActionKinds=false", f)
+		f.RestrictActionKinds {
+		t.Fatalf("LeaseFilter() = %+v, want ExcludeAtespaces=[tenant-a], ExcludeActionKinds=[RESUME_ACTOR], RestrictActionKinds=false", f)
 	}
 	if _, ok := ac.TryAcquireAction("tenant-b", lifecycle.ActionResumeActor); ok {
 		t.Fatal("expected third ResumeActor rejected by ActionResumeActor limit=2")
 	}
 	rOther, okOther := ac.TryAcquireAction("tenant-b", lifecycle.ActionCreateActor)
 	if !okOther {
-		t.Fatal("expected tenant-b CreateActor to succeed under __OTHER__ bucket")
+		t.Fatal("expected tenant-b CreateActor to succeed under fallback limit")
 	}
 	if _, ok := ac.TryAcquireAction("tenant-c", lifecycle.ActionDeleteActor); ok {
-		t.Fatal("expected second __OTHER__ action rejected by otherKindLimit=1")
+		t.Fatal("expected second fallback action rejected by otherKindLimit=1")
 	}
-	if f := ac.LeaseFilter(); !f.ExcludeOtherActionKinds || len(f.BucketedActionKinds) == 0 {
-		t.Fatalf("LeaseFilter() with saturated __OTHER__ = %+v, want ExcludeOtherActionKinds=true and non-empty BucketedActionKinds", f)
+	if f := ac.LeaseFilter(); !f.RestrictActionKinds || len(f.AllowedActionKinds) != 3 {
+		t.Fatalf("LeaseFilter() with saturated fallback pool = %+v, want RestrictActionKinds=true and 3 unsaturated dedicated kinds", f)
+	} else {
+		for _, k := range f.AllowedActionKinds {
+			if k == lifecycle.ActionResumeActor {
+				t.Fatalf("LeaseFilter() AllowedActionKinds included saturated RESUME_ACTOR: %+v", f.AllowedActionKinds)
+			}
+		}
 	}
 
 	// WaitForActionSlot wakes immediately once r1 frees a slot on tenant-a / ResumeActor.

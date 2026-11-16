@@ -85,13 +85,13 @@ type LeaseFilter struct {
 	// ExcludeActionKinds skips due rows whose runnable head action (Actions[0]
 	// with NotBefore <= now) has a Kind in this list.
 	ExcludeActionKinds []lifecycle.ActionKind
-	// ExcludeOtherActionKinds, when true, skips due rows whose runnable head
-	// action has a Kind outside BucketedActionKinds (used when the shared
-	// fallback action-kind bucket is at capacity).
-	ExcludeOtherActionKinds bool
-	// BucketedActionKinds lists the explicitly bucketed ActionKind values when
-	// ExcludeOtherActionKinds is true.
-	BucketedActionKinds []lifecycle.ActionKind
+	// RestrictActionKinds, when true, restricts due rows with a runnable head
+	// action to only those whose head Action.Kind is in AllowedActionKinds
+	// (due timer-only rows with no runnable head action remain eligible).
+	RestrictActionKinds bool
+	// AllowedActionKinds lists the runnable head ActionKind values permitted
+	// when RestrictActionKinds is true.
+	AllowedActionKinds []lifecycle.ActionKind
 }
 
 // MergeLeaseFilters combines zero or more [LeaseFilter] values into one.
@@ -102,13 +102,36 @@ func MergeLeaseFilters(filters []LeaseFilter) LeaseFilter {
 	case 1:
 		return filters[0]
 	default:
-		var out LeaseFilter
+		var (
+			out        LeaseFilter
+			allowedSet map[lifecycle.ActionKind]struct{}
+		)
 		for _, f := range filters {
 			out.ExcludeAtespaces = append(out.ExcludeAtespaces, f.ExcludeAtespaces...)
 			out.ExcludeActionKinds = append(out.ExcludeActionKinds, f.ExcludeActionKinds...)
-			if f.ExcludeOtherActionKinds {
-				out.ExcludeOtherActionKinds = true
-				out.BucketedActionKinds = append(out.BucketedActionKinds, f.BucketedActionKinds...)
+			if !f.RestrictActionKinds {
+				continue
+			}
+			if !out.RestrictActionKinds {
+				out.RestrictActionKinds = true
+				allowedSet = make(map[lifecycle.ActionKind]struct{}, len(f.AllowedActionKinds))
+				for _, k := range f.AllowedActionKinds {
+					allowedSet[k] = struct{}{}
+				}
+				continue
+			}
+			nextAllowed := make(map[lifecycle.ActionKind]struct{}, len(allowedSet))
+			for _, k := range f.AllowedActionKinds {
+				if _, ok := allowedSet[k]; ok {
+					nextAllowed[k] = struct{}{}
+				}
+			}
+			allowedSet = nextAllowed
+		}
+		if out.RestrictActionKinds && len(allowedSet) > 0 {
+			out.AllowedActionKinds = make([]lifecycle.ActionKind, 0, len(allowedSet))
+			for k := range allowedSet {
+				out.AllowedActionKinds = append(out.AllowedActionKinds, k)
 			}
 		}
 		return out
