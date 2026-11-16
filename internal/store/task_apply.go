@@ -54,7 +54,7 @@ type TaskRow struct {
 	LastHeartbeatAt  *time.Time             // Updated by batched heartbeat flushes.
 	NextReconcileAt  *time.Time             // Queue wakeup timestamp; nil when task is at rest.
 	LeaseOwner       string                 // Active queue worker lease holder ("<worker>:<token>").
-	LeaseExpiresAt   *time.Time
+	LeaseExpiresAt   *time.Time             // Expiration timestamp of LeaseOwner in store clock time.
 }
 
 // Clone returns a deep copy of r safe to mutate inside an ApplyFunc.

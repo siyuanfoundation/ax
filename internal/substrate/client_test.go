@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type mockControlClient struct {
@@ -53,14 +54,13 @@ type mockControlClient struct {
 	createTagErrs       []error
 	deleteTagErrs       []error
 	deleteTagCalls      int
-	suspendCalls        []*ateapipb.SuspendActorRequest
-}
-
-func (m *mockControlClient) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest, opts ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.suspendCalls = append(m.suspendCalls, req)
-	return &ateapipb.SuspendActorResponse{}, nil
+	suspendReqs         []*ateapipb.SuspendActorRequest
+	suspendResp         *ateapipb.SuspendActorResponse
+	suspendErrs         []error
+	revertErrs          []error
+	revertResp          *ateapipb.RevertActorResponse
+	getActorOverride    *ateapipb.Actor
+	getActorOverrideErr error
 }
 
 func (m *mockControlClient) CreateActorEgressPolicy(ctx context.Context, req *ateapipb.CreateActorEgressPolicyRequest, opts ...grpc.CallOption) (*ateapipb.EgressPolicy, error) {
@@ -78,6 +78,10 @@ func (m *mockControlClient) CreateActorEgressPolicy(ctx context.Context, req *at
 		return nil, m.createPolicyErr
 	}
 	return req.GetEgressPolicy(), nil
+}
+
+func (m *mockControlClient) GetActorEgressPolicy(ctx context.Context, req *ateapipb.GetActorEgressPolicyRequest, opts ...grpc.CallOption) (*ateapipb.EgressPolicy, error) {
+	return nil, status.Error(codes.NotFound, "no egress policy")
 }
 
 func (m *mockControlClient) GetActorTemplate(ctx context.Context, req *ateapipb.GetActorTemplateRequest, opts ...grpc.CallOption) (*ateapipb.ActorTemplate, error) {
@@ -145,6 +149,9 @@ func (m *mockControlClient) GetActor(ctx context.Context, req *ateapipb.GetActor
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.getCalls = append(m.getCalls, req)
+	if m.getActorOverride != nil || m.getActorOverrideErr != nil {
+		return m.getActorOverride, m.getActorOverrideErr
+	}
 	if m.actorRemaining > 0 {
 		m.actorRemaining--
 		return &ateapipb.Actor{
@@ -156,6 +163,39 @@ func (m *mockControlClient) GetActor(ctx context.Context, req *ateapipb.GetActor
 		}, nil
 	}
 	return nil, status.Error(codes.NotFound, "actor not found")
+}
+
+func (m *mockControlClient) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest, opts ...grpc.CallOption) (*ateapipb.SuspendActorResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.suspendReqs = append(m.suspendReqs, req)
+	if len(m.suspendErrs) > 0 {
+		err := m.suspendErrs[0]
+		m.suspendErrs = m.suspendErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if m.suspendResp != nil {
+		return m.suspendResp, nil
+	}
+	return &ateapipb.SuspendActorResponse{}, nil
+}
+
+func (m *mockControlClient) RevertActor(ctx context.Context, req *ateapipb.RevertActorRequest, opts ...grpc.CallOption) (*ateapipb.RevertActorResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.revertErrs) > 0 {
+		err := m.revertErrs[0]
+		m.revertErrs = m.revertErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if m.revertResp != nil {
+		return m.revertResp, nil
+	}
+	return &ateapipb.RevertActorResponse{}, nil
 }
 
 func (m *mockControlClient) CreateActor(ctx context.Context, req *ateapipb.CreateActorRequest, opts ...grpc.CallOption) (*ateapipb.Actor, error) {
@@ -755,19 +795,19 @@ func TestClient_SuspendActorAndWaitForSnapshot(t *testing.T) {
 	if err := c.SuspendActorAndWaitForSnapshot(ctx, "default", "setup-sync"); err != nil {
 		t.Fatalf("SuspendActorAndWaitForSnapshot: %v", err)
 	}
-	if len(mock.suspendCalls) != 2 {
-		t.Fatalf("suspendCalls = %d, want 2", len(mock.suspendCalls))
+	if len(mock.suspendReqs) != 2 {
+		t.Fatalf("suspendReqs = %d, want 2", len(mock.suspendReqs))
 	}
-	if got := mock.suspendCalls[0].GetActor().GetName(); got != "task-async" {
+	if got := mock.suspendReqs[0].GetActor().GetName(); got != "task-async" {
 		t.Errorf("SuspendActor actor = %q, want %q", got, "task-async")
 	}
-	if got := mock.suspendCalls[0].GetOptions(); got != nil {
+	if got := mock.suspendReqs[0].GetOptions(); got != nil {
 		t.Errorf("SuspendActor options = %+v, want nil", got)
 	}
-	if got := mock.suspendCalls[1].GetActor().GetName(); got != "setup-sync" {
+	if got := mock.suspendReqs[1].GetActor().GetName(); got != "setup-sync" {
 		t.Errorf("SuspendActorAndWaitForSnapshot actor = %q, want %q", got, "setup-sync")
 	}
-	if got := mock.suspendCalls[1].GetOptions().GetMode(); got != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+	if got := mock.suspendReqs[1].GetOptions().GetMode(); got != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
 		t.Errorf("SuspendActorAndWaitForSnapshot mode = %v, want DURABILITY_MODE_SYNCHRONOUS", got)
 	}
 }
@@ -787,4 +827,290 @@ func TestClient_EnsureActorEgressPolicy_RetriesAborted(t *testing.T) {
 	if mock.createPolicyCalls != 2 {
 		t.Errorf("createPolicyCalls = %d, want 2", mock.createPolicyCalls)
 	}
+}
+
+func TestClient_SuspendSyncRevertAndEnsureSnapshotTag(t *testing.T) {
+	oldInterval := defaultRetryInterval
+	defaultRetryInterval = 2 * time.Millisecond
+	defer func() { defaultRetryInterval = oldInterval }()
+
+	ctx := context.Background()
+
+	t.Run("SuspendActorSync sends synchronous durability mode and waits for pending upload", func(t *testing.T) {
+		mock := &mockControlClient{
+			suspendErrs: []error{status.Error(codes.Aborted, "conflict"), nil},
+			suspendResp: &ateapipb.SuspendActorResponse{
+				Actor: &ateapipb.Actor{
+					Status: &ateapipb.ActorStatus{
+						State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+						LastAssignedGeneration: 5,
+						Snapshots: []*ateapipb.Snapshot{
+							{
+								Generation:      4,
+								DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED},
+							},
+							{
+								Generation:      5,
+								DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING},
+							},
+						},
+					},
+				},
+			},
+			getActorOverride: &ateapipb.Actor{
+				Status: &ateapipb.ActorStatus{
+					State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+					LastAssignedGeneration: 5,
+					Snapshots: []*ateapipb.Snapshot{
+						{
+							Generation:      5,
+							DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED},
+						},
+					},
+				},
+			},
+		}
+		c := &Client{control: mock}
+
+		// WithSingleAttempt returns ErrSnapshotUploadPending immediately while generation 5 is still PENDING.
+		mockSingle := &mockControlClient{suspendResp: mock.suspendResp}
+		cSingle := &Client{control: mockSingle}
+		if _, err := cSingle.SuspendActorSync(WithSingleAttempt(ctx), "default", "actor-1"); !errors.Is(err, ErrSnapshotUploadPending) || status.Code(err) != codes.Unavailable {
+			t.Fatalf("SuspendActorSync(WithSingleAttempt, pending) = %v, want ErrSnapshotUploadPending/Unavailable", err)
+		}
+
+		// Direct caller retries Aborted and polls GetActor until generation 5 is COMPLETED.
+		gen, err := c.SuspendActorSync(ctx, "default", "actor-1")
+		if err != nil || gen != 5 {
+			t.Fatalf("SuspendActorSync = (%d, %v), want (5, nil)", gen, err)
+		}
+		if len(mock.suspendReqs) != 2 || mock.suspendReqs[0].GetOptions().GetMode() != ateapipb.DurabilityMode_DURABILITY_MODE_SYNCHRONOUS {
+			t.Fatalf("unexpected SuspendActor requests: %+v", mock.suspendReqs)
+		}
+	})
+
+	t.Run("DeleteActorWithUID skips deletion on UID mismatch", func(t *testing.T) {
+		validUID := "11111111-2222-3333-4444-555555555555"
+		otherUID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+		mock := &mockControlClient{
+			deleteErr: status.Error(codes.Aborted, "Actor default/actor-1 does not have uid "+validUID),
+			getActorOverride: &ateapipb.Actor{
+				Metadata: &ateapipb.ResourceMetadata{Atespace: "default", Name: "actor-1", Uid: otherUID},
+			},
+		}
+		c := &Client{control: mock}
+		if err := c.DeleteActorWithUID(WithSingleAttempt(ctx), "default", "actor-1", validUID); err != nil {
+			t.Fatalf("DeleteActorWithUID(UID mismatch) = %v, want nil", err)
+		}
+		if len(mock.deleteCalls) != 1 || mock.deleteCalls[0].GetOptions().GetUid() != validUID {
+			t.Fatalf("expected single DeleteActor call carrying DeleteOptions.Uid=%q, got %+v", validUID, mock.deleteCalls)
+		}
+
+		// WithSingleAttempt returns ErrResourceDeleting immediately without
+		// polling 150 times when the actor is still DELETING.
+		mockDeleting := &mockControlClient{actorRemaining: 10}
+		cDeleting := &Client{control: mockDeleting}
+		delErr := cDeleting.DeleteActorWithUID(WithSingleAttempt(ctx), "default", "actor-del", "")
+		if !errors.Is(delErr, ErrResourceDeleting) || !IsHealthyRetry(delErr) {
+			t.Fatalf("DeleteActorWithUID(WithSingleAttempt, deleting) = %v, want ErrResourceDeleting/HealthyRetry", delErr)
+		}
+		if len(mockDeleting.getCalls) != 1 {
+			t.Fatalf("expected 1 fast-path GetActor call under WithSingleAttempt, got %d", len(mockDeleting.getCalls))
+		}
+	})
+
+	t.Run("RevertActor treats already-reverted SUSPENDED actor as idempotent success", func(t *testing.T) {
+		mock := &mockControlClient{
+			revertErrs: []error{status.Error(codes.FailedPrecondition, "already at durable snapshot")},
+			getActorOverride: &ateapipb.Actor{
+				Status: &ateapipb.ActorStatus{
+					State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+					Snapshots: []*ateapipb.Snapshot{{
+						Generation:      2,
+						Locality:        "worker-node-cache-1",
+						DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED},
+					}},
+				},
+			},
+		}
+		c := &Client{control: mock}
+		gen, err := c.RevertActor(ctx, "default", "actor-1")
+		if err != nil || gen != 2 {
+			t.Fatalf("RevertActor(already durable with locality) = (%d, %v), want (2, nil)", gen, err)
+		}
+
+		// When SUSPENDED with a PENDING snapshot upload, RevertActor returns
+		// ErrSnapshotUploadPending (Unavailable) so the reconciler retries cleanly.
+		mockPending := &mockControlClient{
+			revertErrs: []error{status.Error(codes.FailedPrecondition, "snapshot upload pending")},
+			getActorOverride: &ateapipb.Actor{
+				Status: &ateapipb.ActorStatus{
+					State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+					LastAssignedGeneration: 3,
+					Snapshots: []*ateapipb.Snapshot{{
+						Generation:      3,
+						DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING},
+					}},
+				},
+			},
+		}
+		cPending := &Client{control: mockPending}
+		if _, err := cPending.RevertActor(WithSingleAttempt(ctx), "default", "actor-1"); !errors.Is(err, ErrSnapshotUploadPending) || !IsHealthyRetry(err) {
+			t.Fatalf("RevertActor(pending upload) = %v, want ErrSnapshotUploadPending/HealthyRetry", err)
+		}
+
+		// When RevertActor fails with FailedPrecondition and GetActor returns
+		// NotFound, RevertActor preserves codes.NotFound for the reconciler.
+		mockGone := &mockControlClient{
+			revertErrs:          []error{status.Error(codes.FailedPrecondition, "cannot revert")},
+			getActorOverrideErr: status.Error(codes.NotFound, "actor gone"),
+		}
+		cGone := &Client{control: mockGone}
+		if _, err := cGone.RevertActor(WithSingleAttempt(ctx), "default", "actor-gone"); status.Code(err) != codes.NotFound {
+			t.Fatalf("RevertActor(NotFound after FailedPrecondition) = %v, want NotFound", err)
+		}
+	})
+
+	t.Run("WithTaskCreateTime rejects pre-existing actor predating task by >30s and DeleteTagWithUID skips UID mismatch", func(t *testing.T) {
+		taskCreated := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
+		oldActor := &ateapipb.Actor{
+			Metadata: &ateapipb.ResourceMetadata{
+				Atespace:   "default",
+				Name:       "foreign-old",
+				Uid:        "11111111-2222-3333-4444-555555555555",
+				CreateTime: timestamppb.New(taskCreated.Add(-2 * time.Minute)),
+			},
+			ActorTemplate: &ateapipb.ObjectRef{Atespace: "default", Name: "ax-tmpl"},
+			Status: &ateapipb.ActorStatus{
+				State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+				LastAssignedGeneration: 1,
+				Snapshots: []*ateapipb.Snapshot{{
+					Generation:      1,
+					Owner:           ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG,
+					DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED},
+				}},
+			},
+		}
+		mock := &mockControlClient{
+			createActorErrs:  []error{status.Error(codes.AlreadyExists, "exists")},
+			getActorOverride: oldActor,
+			tags: map[string]*ateapipb.Tag{
+				"default/tag-1": {
+					Metadata: &ateapipb.ResourceMetadata{
+						Atespace: "default",
+						Name:     "tag-1",
+						Uid:      "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+					},
+				},
+			},
+			deleteTagErrs: []error{status.Error(codes.Aborted, "Tag default/tag-1 does not have uid 11111111-2222-3333-4444-555555555555")},
+		}
+		c := &Client{control: mock}
+		if _, err := c.EnsureTaskActor(WithTaskCreateTime(WithSingleAttempt(ctx), taskCreated), "default", "foreign-old", "ax-tmpl", ""); status.Code(err) != codes.AlreadyExists {
+			t.Fatalf("EnsureTaskActor(old actor) = %v, want AlreadyExists", err)
+		}
+		if err := c.DeleteTagWithUID(WithSingleAttempt(ctx), "default", "tag-1", "11111111-2222-3333-4444-555555555555"); err != nil {
+			t.Fatalf("DeleteTagWithUID(UID mismatch on Aborted) = %v, want nil", err)
+		}
+		if mock.deleteTagCalls != 1 {
+			t.Fatalf("deleteTagCalls = %d, want 1", mock.deleteTagCalls)
+		}
+
+		// EnsureActorTemplate treats an existing ActorTemplate with DeleteTime != nil
+		// as deleting (ErrResourceDeleting / HealthyRetry) under WithSingleAttempt.
+		mockDeletingTmpl := &mockControlClient{
+			templates: map[string]*ateapipb.ActorTemplate{
+				"default/ax-del": {
+					Metadata: &ateapipb.ResourceMetadata{
+						Atespace:   "default",
+						Name:       "ax-del",
+						DeleteTime: timestamppb.New(taskCreated),
+					},
+				},
+			},
+		}
+		cDeletingTmpl := &Client{control: mockDeletingTmpl}
+		_, tmplErr := cDeletingTmpl.EnsureActorTemplate(WithSingleAttempt(ctx), &ateapipb.ActorTemplate{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: "default", Name: "ax-del"},
+		})
+		if !errors.Is(tmplErr, ErrResourceDeleting) || !IsHealthyRetry(tmplErr) {
+			t.Fatalf("EnsureActorTemplate(deleting template) = %v, want ErrResourceDeleting/HealthyRetry", tmplErr)
+		}
+
+		// EnsureActorTemplate retries CreateActorTemplate once when a deleting
+		// template disappears between CreateActorTemplate(AlreadyExists) and GetActorTemplate(NotFound).
+		mockRaceTmpl := &mockControlClient{
+			createTemplateErrs: []error{status.Error(codes.AlreadyExists, "deleting template"), nil},
+		}
+		cRaceTmpl := &Client{control: mockRaceTmpl}
+		ensuredTmpl, raceErr := cRaceTmpl.EnsureActorTemplate(WithSingleAttempt(ctx), &ateapipb.ActorTemplate{
+			Metadata: &ateapipb.ResourceMetadata{Atespace: "default", Name: "ax-race-tmpl"},
+		})
+		if raceErr != nil || ensuredTmpl.GetMetadata().GetName() != "ax-race-tmpl" {
+			t.Fatalf("EnsureActorTemplate(AlreadyExists->NotFound race) = (%v, %v), want created template", ensuredTmpl, raceErr)
+		}
+	})
+
+	t.Run("EnsureSnapshotTag reuses completed tag and recreates incomplete tag", func(t *testing.T) {
+		completedTag := &ateapipb.Tag{
+			Metadata:    &ateapipb.ResourceMetadata{Atespace: "default", Name: "tag-done"},
+			SourceActor: &ateapipb.ObjectRef{Atespace: "default", Name: "actor-1"},
+			Status: &ateapipb.TagStatus{
+				Snapshot: &ateapipb.Snapshot{
+					DurableSnapshot: &ateapipb.SnapshotStorage{
+						State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+					},
+				},
+			},
+		}
+		pendingTag := &ateapipb.Tag{
+			Metadata:    &ateapipb.ResourceMetadata{Atespace: "default", Name: "tag-pending"},
+			SourceActor: &ateapipb.ObjectRef{Atespace: "default", Name: "actor-1"},
+			Status: &ateapipb.TagStatus{
+				Snapshot: &ateapipb.Snapshot{
+					DurableSnapshot: &ateapipb.SnapshotStorage{
+						State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_PENDING,
+					},
+				},
+			},
+		}
+		otherOwnerTag := &ateapipb.Tag{
+			Metadata:    &ateapipb.ResourceMetadata{Atespace: "default", Name: "tag-other"},
+			SourceActor: &ateapipb.ObjectRef{Atespace: "default", Name: "actor-other"},
+			Status:      completedTag.Status,
+		}
+
+		mock := &mockControlClient{
+			tags: map[string]*ateapipb.Tag{
+				"default/tag-done":    completedTag,
+				"default/tag-pending": pendingTag,
+				"default/tag-other":   otherOwnerTag,
+			},
+			createTagErrs: []error{
+				status.Error(codes.AlreadyExists, "done exists"),
+				status.Error(codes.AlreadyExists, "pending exists"),
+				nil, // recreate after DeleteTag
+				status.Error(codes.AlreadyExists, "other exists"),
+			},
+		}
+		c := &Client{control: mock}
+
+		if got, err := c.EnsureSnapshotTag(ctx, "default", "tag-done", "actor-1"); err != nil || got.GetMetadata().GetName() != "tag-done" {
+			t.Fatalf("EnsureSnapshotTag(done) = %v, %v", got, err)
+		}
+		if mock.deleteTagCalls != 0 {
+			t.Fatalf("expected 0 DeleteTag calls for completed tag, got %d", mock.deleteTagCalls)
+		}
+
+		if got, err := c.EnsureSnapshotTag(ctx, "default", "tag-pending", "actor-1"); err != nil || got.GetMetadata().GetName() != "tag-pending" {
+			t.Fatalf("EnsureSnapshotTag(pending) = %v, %v", got, err)
+		}
+		if mock.deleteTagCalls != 1 {
+			t.Fatalf("expected 1 DeleteTag call for incomplete tag, got %d", mock.deleteTagCalls)
+		}
+
+		if _, err := c.EnsureSnapshotTag(ctx, "default", "tag-other", "actor-1"); status.Code(err) != codes.AlreadyExists {
+			t.Fatalf("EnsureSnapshotTag(other owner) = %v, want AlreadyExists", err)
+		}
+	})
 }

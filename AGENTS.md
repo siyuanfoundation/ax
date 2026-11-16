@@ -24,9 +24,10 @@ cmd/ax-task-runner     PID 1 inside the sandbox; materializes the Workspace, run
 internal/apivalidation Manifest admission validation (common, task, workspace, model, gateway); server-side only
 internal/controller    TaskReconciler + WorkspaceManager: Substrate side of task lifecycle and workspace snapshot tags; reconciler_test.go is the test template
 internal/lifecycle     Pure Task lifecycle contract (State, Input, TransitionFunc, NextReconcileAt) and action queue types
+internal/reconciler    Leased Task action-queue worker pool, inline executor, admission control, and Substrate runtime adapter
 internal/resources     Kubernetes CPU/memory resource quantity parsing
 internal/server        gRPC handlers
-internal/store/        memory + postgres backends, plus TaskApplier contract (schema.sql and schema.go change together)
+internal/store/        memory + postgres backends, plus TaskApplier and TaskQueue contracts (schema.sql and schema.go change together)
 internal/substrate     The only place that talks to the Substrate Control API
 internal/workspace     spec.setup execution (git clone / inline files / skills dir / commands; MCP is read via metadata server)
 internal/{tunnel,guest,metadata}  k8s port-forward, in-sandbox guest client, metadata server
@@ -48,11 +49,11 @@ skills/                Developer skills (SKILL.md format). .agents/skills, .clau
 export GOTOOLCHAIN=auto          # go.mod wants 1.27.1; older local Go auto-downloads it
 make verify                      # make generate, go mod tidy, go fmt, golangci-lint (CI asserts no diff)
 go build ./cmd/ax ./cmd/ax-server ./cmd/ax-task-runner
-go test ./...                    # ~20 s, 23 packages with tests; Postgres + E2E tiers self-skip
+go test ./...                    # ~20 s, 24 packages with tests; Postgres + E2E tiers self-skip
 ```
 
 Opt-in tiers:
-- **Postgres store**: set `AX_TEST_POSTGRES_URL='postgres://ax:ax@localhost:5432/ax?sslmode=disable'` (CI runs `postgres:17-alpine`) and run `go test -count=1 ./internal/store/postgres/...`.
+- **Postgres store & reconciler**: set `AX_TEST_POSTGRES_URL='postgres://ax:ax@localhost:5432/ax?sslmode=disable'` (CI runs `postgres:17-alpine`) and run `go test -count=1 ./internal/store/postgres/... ./internal/reconciler/...`.
 - **E2E**: `make test-e2e` (or `make test-e2e E2E_ARGS='-test.run TestE2E_ModelCRUD'`; see `test/e2e/README.md`).
 
 ## Rules
@@ -83,7 +84,7 @@ location is where to look. How-to lives in the skills.
   (`internal/metadata/server.go`, `cmd/ax/main.go`).
 - Unit tests run against in-process fakes: `mockControlServer`
   (`internal/controller/reconciler_test.go`) and `internal/substrate/substratetest`
-  (`internal/server/server_test.go`, `cmd/ax/main_test.go`).
+  (`internal/reconciler/reconciler_test.go`, `internal/reconciler/reconciler_postgres_test.go`, `internal/server/server_test.go`, `cmd/ax/main_test.go`).
 - `go.mod` has no `replace` directive; E2E installs Substrate at the `go.mod`
   version (`hack/setup-e2e-kind.sh`).
 
@@ -121,7 +122,7 @@ skill source there. Adding a skill means adding a row above.
 ## Definition of done
 
 1. The three CI commands above pass locally.
-2. Postgres or E2E tier passes if you touched `internal/store/postgres` or
-   the E2E paths.
+2. Postgres or E2E tier passes if you touched `internal/store/postgres`,
+   `internal/reconciler`, or the E2E paths.
 3. `/sync-contract` has been run against your diff so `AGENTS.md` and `skills/`
    stay in sync with the code.

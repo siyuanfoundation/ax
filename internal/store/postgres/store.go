@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package postgres implements store.Store and lock.Locker on PostgreSQL.
+// Package postgres implements store.Store, store.TaskQueue, and lock.Locker on
+// PostgreSQL.
 //
 // Open takes a libpq-style connection URL; standard libpq environment
 // variables such as PGPASSWORD fill in what it leaves out.
@@ -24,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/ax/internal/lock"
@@ -36,7 +38,11 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const defaultPageLimit = 50
+const (
+	defaultPageLimit             = 50
+	defaultApplyLockTimeout      = 2 * time.Second
+	defaultApplyStatementTimeout = 5 * time.Second
+)
 
 var unmarshalOpts = protojson.UnmarshalOptions{DiscardUnknown: true}
 
@@ -49,19 +55,31 @@ type Options struct {
 	// LockRetryInterval is how often lock waiters retry acquisition
 	// (default 1s).
 	LockRetryInterval time.Duration
+	// ApplyLockTimeout bounds how long Apply, LeaseTask, RenewLease,
+	// ReleaseLease, and BackoffAction wait for a contended task row lock before
+	// returning store.ErrLockTimeout (default 2s).
+	ApplyLockTimeout time.Duration
+	// ApplyStatementTimeout bounds the total execution time of a single Apply
+	// or queue mutation transaction before returning store.ErrLockTimeout
+	// (default 5s).
+	ApplyStatementTimeout time.Duration
 }
 
-// Store is a PostgreSQL implementation of store.Store. It is also a
-// lock.Locker (see Lock) whose locks are shared by every ax-server replica
-// using the same database.
+// Store is a PostgreSQL implementation of store.Store and store.TaskQueue. It
+// is also a lock.Locker (see Lock) whose locks are shared by every ax-server
+// replica using the same database.
 type Store struct {
 	pool *pgxpool.Pool
 	opts Options
+
+	wakeupMu sync.RWMutex
+	wakeup   func()
 }
 
 var (
-	_ store.Store = (*Store)(nil)
-	_ lock.Locker = (*Store)(nil)
+	_ store.Store     = (*Store)(nil)
+	_ store.TaskQueue = (*Store)(nil)
+	_ lock.Locker     = (*Store)(nil)
 )
 
 // Open connects to the database at connURL and creates any missing tables.
@@ -71,6 +89,12 @@ func Open(ctx context.Context, connURL string, opts Options) (*Store, error) {
 	}
 	if opts.LockRetryInterval <= 0 {
 		opts.LockRetryInterval = time.Second
+	}
+	if opts.ApplyLockTimeout <= 0 {
+		opts.ApplyLockTimeout = defaultApplyLockTimeout
+	}
+	if opts.ApplyStatementTimeout <= 0 {
+		opts.ApplyStatementTimeout = defaultApplyStatementTimeout
 	}
 
 	cfg, err := pgxpool.ParseConfig(connURL)
@@ -222,15 +246,55 @@ func (s *Store) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 	if task.Status.State == v1alpha1.TaskState_TASK_STATE_UNSPECIFIED && task.Metadata.GetDeleteTime() == nil {
 		task.Status.State = v1alpha1.TaskState_TASK_STATE_QUEUED
 	}
-	return s.save(ctx, tasksTable, task.Metadata, task)
+	data, err := protojson.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("marshaling tasks: %w", err)
+	}
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO tasks (atespace, name, data, saved_at, state, generation, session_id)
+		VALUES ($1, $2, $3, clock_timestamp(), $4, $5, $6)
+		ON CONFLICT (atespace, name) DO UPDATE
+		SET data       = EXCLUDED.data,
+		    saved_at   = EXCLUDED.saved_at,
+		    state      = EXCLUDED.state,
+		    generation = GREATEST(tasks.generation, EXCLUDED.generation),
+		    session_id = EXCLUDED.session_id`,
+		task.Metadata.Atespace,
+		task.Metadata.Name,
+		string(data),
+		int16(task.Status.State),
+		task.Status.Generation,
+		task.GetSpec().GetSessionId(),
+	)
+	if err != nil {
+		return fmt.Errorf("saving tasks: %w", err)
+	}
+	return nil
 }
 
-// GetTask retrieves a task by atespace and name.
+// GetTask retrieves a task by atespace and name, overlaying the authoritative
+// column generation when Apply skipped rewriting an otherwise-unchanged JSONB
+// document.
 func (s *Store) GetTask(ctx context.Context, atespace, name string) (*v1alpha1.Task, error) {
-	var task v1alpha1.Task
-	if err := s.get(ctx, tasksTable, atespace, name, &task); err != nil {
-		return nil, err
+	var (
+		data       []byte
+		generation int64
+	)
+	err := s.pool.QueryRow(ctx,
+		`SELECT data, generation FROM tasks WHERE atespace = $1 AND name = $2`,
+		defaultAtespace(atespace), name,
+	).Scan(&data, &generation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, store.ErrNotFound
 	}
+	if err != nil {
+		return nil, fmt.Errorf("getting tasks: %w", err)
+	}
+	var task v1alpha1.Task
+	if err := unmarshalOpts.Unmarshal(data, &task); err != nil {
+		return nil, fmt.Errorf("unmarshaling tasks: %w", err)
+	}
+	overlayTaskGeneration(&task, generation)
 	return &task, nil
 }
 
@@ -240,7 +304,56 @@ func (s *Store) ListTasks(ctx context.Context, atespace string, limit, offset in
 	if limit <= 0 {
 		limit = defaultPageLimit
 	}
-	return list(ctx, s, tasksTable, atespace, limit, offset, func() *v1alpha1.Task { return &v1alpha1.Task{} })
+	query := `SELECT data, generation FROM tasks`
+	args := []any{}
+	if atespace != "" && atespace != "*" {
+		query += ` WHERE atespace = $1`
+		args = append(args, atespace)
+	}
+	query += ` ORDER BY saved_at DESC, atespace, name`
+	args = append(args, limit)
+	query += fmt.Sprintf(` LIMIT $%d`, len(args))
+	if offset > 0 {
+		args = append(args, offset)
+		query += fmt.Sprintf(` OFFSET $%d`, len(args))
+	}
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("listing tasks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*v1alpha1.Task
+	for rows.Next() {
+		var (
+			data       []byte
+			generation int64
+		)
+		if err := rows.Scan(&data, &generation); err != nil {
+			return nil, fmt.Errorf("listing tasks: %w", err)
+		}
+		var task v1alpha1.Task
+		if err := unmarshalOpts.Unmarshal(data, &task); err != nil {
+			slog.Warn("skipping unreadable record", "table", tasksTable, "error", err)
+			continue
+		}
+		overlayTaskGeneration(&task, generation)
+		out = append(out, &task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing tasks: %w", err)
+	}
+	return out, nil
+}
+
+func overlayTaskGeneration(task *v1alpha1.Task, generation int64) {
+	if task != nil && generation > task.GetStatus().GetGeneration() {
+		if task.Status == nil {
+			task.Status = &v1alpha1.TaskStatus{}
+		}
+		task.Status.Generation = generation
+	}
 }
 
 // UpdateTaskStatus replaces only the status of a task. It does not change the
@@ -248,9 +361,12 @@ func (s *Store) ListTasks(ctx context.Context, atespace string, limit, offset in
 func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, status *v1alpha1.TaskStatus) error {
 	atespace = defaultAtespace(atespace)
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		var data []byte
-		err := tx.QueryRow(ctx, `SELECT data FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE`,
-			atespace, name).Scan(&data)
+		var (
+			data       []byte
+			generation int64
+		)
+		err := tx.QueryRow(ctx, `SELECT data, generation FROM tasks WHERE atespace = $1 AND name = $2 FOR UPDATE`,
+			atespace, name).Scan(&data, &generation)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return store.ErrNotFound
 		}
@@ -262,11 +378,13 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, atespace, name string, sta
 			return fmt.Errorf("unmarshaling task: %w", err)
 		}
 		task.Status = status
+		nextGen := max(generation, status.GetGeneration())
+		overlayTaskGeneration(&task, nextGen)
 		if data, err = protojson.Marshal(&task); err != nil {
 			return fmt.Errorf("marshaling task status: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `UPDATE tasks SET data = $3 WHERE atespace = $1 AND name = $2`,
-			atespace, name, string(data)); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET data = $3, state = $4, generation = $5 WHERE atespace = $1 AND name = $2`,
+			atespace, name, string(data), int16(status.GetState()), nextGen); err != nil {
 			return fmt.Errorf("updating task status: %w", err)
 		}
 		return nil

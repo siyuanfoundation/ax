@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/google/ax/internal/substrate"
+	"github.com/google/uuid"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -40,6 +41,7 @@ type Errors struct {
 	CreateEgressPolicy error
 	SuspendActor       error
 	ResumeActor        error
+	RevertActor        error
 	DeleteActor        error
 	CreateTag          error
 	DeleteTag          error
@@ -250,7 +252,7 @@ func (s *Server) CreateActorTemplate(_ context.Context, req *ateapipb.CreateActo
 		tmpl.Metadata = &ateapipb.ResourceMetadata{}
 	}
 	if tmpl.Metadata.Uid == "" {
-		tmpl.Metadata.Uid = "uid-" + k
+		tmpl.Metadata.Uid = uuid.NewString()
 	}
 	s.templates[k] = tmpl
 	return proto.Clone(tmpl).(*ateapipb.ActorTemplate), nil
@@ -298,6 +300,12 @@ func (s *Server) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest
 		if !ok {
 			return nil, status.Errorf(codes.NotFound, "source tag %s/%s not found", tagRef.GetAtespace(), tagRef.GetName())
 		}
+		if tag.GetMetadata().GetDeleteTime() != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "source tag %s/%s is deleting", tagRef.GetAtespace(), tagRef.GetName())
+		}
+		if tag.GetStatus().GetSnapshot().GetDurableSnapshot().GetState() != ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			return nil, status.Errorf(codes.FailedPrecondition, "source tag %s/%s snapshot is not completed", tagRef.GetAtespace(), tagRef.GetName())
+		}
 		if tplRef := req.GetActor().GetActorTemplate(); tplRef != nil {
 			if tpl, ok := s.templates[key(tplRef.GetAtespace(), tplRef.GetName())]; ok {
 				tagUID := tag.GetStatus().GetActorTemplateUid()
@@ -313,9 +321,22 @@ func (s *Server) CreateActor(_ context.Context, req *ateapipb.CreateActorRequest
 		actor.Metadata = &ateapipb.ResourceMetadata{}
 	}
 	if actor.Metadata.Uid == "" {
-		actor.Metadata.Uid = "actor-uid-" + k
+		actor.Metadata.Uid = uuid.NewString()
 	}
-	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
+	// Mirror Substrate 1.0's initial golden/source-tag snapshot metadata
+	// (SNAPSHOT_OWNER_TAG, generation 1, COMPLETED) on newly created actors.
+	actor.Status = &ateapipb.ActorStatus{
+		State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		LastAssignedGeneration: 1,
+		Snapshots: []*ateapipb.Snapshot{{
+			Uuid:       "init-snap-" + actor.GetMetadata().GetName(),
+			Generation: 1,
+			Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG,
+			DurableSnapshot: &ateapipb.SnapshotStorage{
+				State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+			},
+		}},
+	}
 	s.actors[k] = actor
 	return proto.Clone(actor).(*ateapipb.Actor), nil
 }
@@ -330,8 +351,27 @@ func (s *Server) SuspendActor(_ context.Context, req *ateapipb.SuspendActorReque
 	if err != nil {
 		return nil, err
 	}
-	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
-	return &ateapipb.SuspendActorResponse{}, nil
+	state := actor.GetStatus().GetState()
+	if state == ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		return &ateapipb.SuspendActorResponse{Actor: proto.Clone(actor).(*ateapipb.Actor)}, nil
+	}
+	if state != ateapipb.ActorState_ACTOR_STATE_RUNNING && state != ateapipb.ActorState_ACTOR_STATE_SUSPENDING {
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s cannot be suspended from %v", req.GetActor().GetAtespace(), req.GetActor().GetName(), state)
+	}
+	nextGen := actor.GetStatus().GetLastAssignedGeneration() + 1
+	actor.Status = &ateapipb.ActorStatus{
+		State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		LastAssignedGeneration: nextGen,
+		Snapshots: []*ateapipb.Snapshot{{
+			Uuid:       "snap-" + actor.GetMetadata().GetName(),
+			Generation: nextGen,
+			Owner:      ateapipb.SnapshotOwner_SNAPSHOT_OWNER_ACTOR,
+			DurableSnapshot: &ateapipb.SnapshotStorage{
+				State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
+			},
+		}},
+	}
+	return &ateapipb.SuspendActorResponse{Actor: proto.Clone(actor).(*ateapipb.Actor)}, nil
 }
 
 func (s *Server) ResumeActor(_ context.Context, req *ateapipb.ResumeActorRequest) (*ateapipb.ResumeActorResponse, error) {
@@ -344,7 +384,16 @@ func (s *Server) ResumeActor(_ context.Context, req *ateapipb.ResumeActorRequest
 	if err != nil {
 		return nil, err
 	}
-	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_RUNNING}
+	prevStatus := actor.GetStatus()
+	if st := prevStatus.GetState(); st == ateapipb.ActorState_ACTOR_STATE_CRASHED || st == ateapipb.ActorState_ACTOR_STATE_DELETING {
+		return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s cannot be resumed from %v",
+			req.GetActor().GetAtespace(), req.GetActor().GetName(), st)
+	}
+	actor.Status = &ateapipb.ActorStatus{
+		State:                  ateapipb.ActorState_ACTOR_STATE_RUNNING,
+		LastAssignedGeneration: prevStatus.GetLastAssignedGeneration(),
+		Snapshots:              slicesCloneSnapshots(prevStatus.GetSnapshots()),
+	}
 	if s.workerIP != "" {
 		actor.Status.WorkerAssignment = &ateapipb.WorkerAssignment{WorkerPod: "worker-pod-1", WorkerPodIps: []string{s.workerIP}}
 	}
@@ -352,16 +401,61 @@ func (s *Server) ResumeActor(_ context.Context, req *ateapipb.ResumeActorRequest
 }
 
 // RevertActor leaves the actor suspended, as if restored from its last
-// snapshot.
+// snapshot. Matching Substrate 1.0, calling RevertActor on an actor that is
+// already SUSPENDED with no node-local or pending-upload snapshot returns
+// FailedPrecondition.
 func (s *Server) RevertActor(_ context.Context, req *ateapipb.RevertActorRequest) (*ateapipb.RevertActorResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.errs.RevertActor != nil {
+		return nil, s.errs.RevertActor
+	}
 	actor, err := s.lookupActor(req.GetActor())
 	if err != nil {
 		return nil, err
 	}
-	actor.Status = &ateapipb.ActorStatus{State: ateapipb.ActorState_ACTOR_STATE_SUSPENDED}
+	prevStatus := actor.GetStatus()
+	if prevStatus.GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED {
+		hasNodeOrPending := substrate.HasPendingSnapshotUpload(actor)
+		for _, snap := range prevStatus.GetSnapshots() {
+			if snap.GetLocality() != "" {
+				hasNodeOrPending = true
+				break
+			}
+		}
+		if !hasNodeOrPending {
+			return nil, status.Errorf(codes.FailedPrecondition, "actor %s/%s is already suspended at its durable snapshot",
+				req.GetActor().GetAtespace(), req.GetActor().GetName())
+		}
+	}
+	var durableSnaps []*ateapipb.Snapshot
+	for _, snap := range prevStatus.GetSnapshots() {
+		if snap.GetDurableSnapshot().GetState() == ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED {
+			cp := proto.Clone(snap).(*ateapipb.Snapshot)
+			cp.Locality = ""
+			durableSnaps = append(durableSnaps, cp)
+		}
+	}
+	// Per ateapi.proto, LastAssignedGeneration is monotonic and does not
+	// decrease on RevertActor even when a newer pending/node-local snapshot
+	// generation is discarded.
+	actor.Status = &ateapipb.ActorStatus{
+		State:                  ateapipb.ActorState_ACTOR_STATE_SUSPENDED,
+		LastAssignedGeneration: prevStatus.GetLastAssignedGeneration(),
+		Snapshots:              durableSnaps,
+	}
 	return &ateapipb.RevertActorResponse{Actor: proto.Clone(actor).(*ateapipb.Actor)}, nil
+}
+
+func slicesCloneSnapshots(snaps []*ateapipb.Snapshot) []*ateapipb.Snapshot {
+	if len(snaps) == 0 {
+		return nil
+	}
+	out := make([]*ateapipb.Snapshot, len(snaps))
+	for i, snap := range snaps {
+		out[i] = proto.Clone(snap).(*ateapipb.Snapshot)
+	}
+	return out
 }
 
 // DeleteActor removes the actor at once, so the client's follow-up GetActor
@@ -385,6 +479,14 @@ func (s *Server) DeleteActor(_ context.Context, req *ateapipb.DeleteActorRequest
 	actor, err := s.lookupActor(ref)
 	if err != nil {
 		return nil, err
+	}
+	if opts := req.GetOptions(); opts != nil {
+		if opts.GetUid() != "" && actor.GetMetadata().GetUid() != opts.GetUid() {
+			return nil, status.Errorf(codes.Aborted, "Actor %s/%s does not have uid %s", ref.GetAtespace(), ref.GetName(), opts.GetUid())
+		}
+		if opts.GetVersion() > 0 && actor.GetMetadata().GetVersion() != opts.GetVersion() {
+			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+		}
 	}
 	delete(s.actors, key(ref.GetAtespace(), ref.GetName()))
 	delete(s.egressPolicies, key(ref.GetAtespace(), ref.GetName()))
@@ -472,9 +574,17 @@ func (s *Server) CreateTag(_ context.Context, req *ateapipb.CreateTagRequest) (*
 		}
 	}
 	tag := proto.Clone(in).(*ateapipb.Tag)
+	if tag.Metadata == nil {
+		tag.Metadata = &ateapipb.ResourceMetadata{}
+	}
+	if tag.Metadata.Uid == "" {
+		tag.Metadata.Uid = uuid.NewString()
+	}
 	tag.Status = &ateapipb.TagStatus{
 		ActorTemplateUid: tmplUID,
 		Snapshot: &ateapipb.Snapshot{
+			Uuid:       "tag-snap-" + meta.GetName(),
+			Generation: max(substrate.LatestDurableSnapshotGeneration(src), 1),
 			DurableSnapshot: &ateapipb.SnapshotStorage{
 				State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED,
 			},
@@ -519,6 +629,14 @@ func (s *Server) DeleteTag(_ context.Context, req *ateapipb.DeleteTagRequest) (*
 	tag, ok := s.tags[k]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "tag %s not found", k)
+	}
+	if opts := req.GetOptions(); opts != nil {
+		if opts.GetUid() != "" && tag.GetMetadata().GetUid() != opts.GetUid() {
+			return nil, status.Errorf(codes.Aborted, "Tag %s does not have uid %s", k, opts.GetUid())
+		}
+		if opts.GetVersion() > 0 && tag.GetMetadata().GetVersion() != opts.GetVersion() {
+			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+		}
 	}
 	delete(s.tags, k)
 	return tag, nil
