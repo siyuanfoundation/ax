@@ -99,6 +99,7 @@ func (s *MemoryStore) Apply(ctx context.Context, key store.TaskKey, fn store.App
 
 	case next == store.DeleteTaskRow:
 		delete(s.tasks, mapKey)
+		delete(s.taskSavedAt, mapKey)
 		s.mu.Unlock()
 		return nil, nil
 
@@ -126,6 +127,12 @@ func (s *MemoryStore) Apply(ctx context.Context, key store.TaskKey, fn store.App
 		return nil, err
 	}
 	written.Generation = nextGen
+	if stored != nil && !store.RowExpectsHeartbeats(stored) && store.RowExpectsHeartbeats(written) {
+		if written.LastHeartbeatAt == nil || written.LastHeartbeatAt.Before(now) {
+			hb := now
+			written.LastHeartbeatAt = &hb
+		}
+	}
 	written.NextReconcileAt = lifecycle.NextReconcileAt(written.LifecycleState(), now)
 
 	// Preserve an active worker lease from stored and clamp NextReconcileAt so
@@ -144,6 +151,9 @@ func (s *MemoryStore) Apply(ctx context.Context, key store.TaskKey, fn store.App
 		written.LeaseExpiresAt = nil
 	}
 
+	if stored == nil {
+		s.taskSavedAt[mapKey] = now
+	}
 	s.tasks[mapKey] = written
 	ret = written.Clone()
 	shouldWake = written.NextReconcileAt != nil && !written.NextReconcileAt.After(now)

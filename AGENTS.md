@@ -24,10 +24,10 @@ cmd/ax-task-runner     PID 1 inside the sandbox; materializes the Workspace, run
 internal/apivalidation Manifest admission validation (common, task, workspace, model, gateway); server-side only
 internal/controller    TaskReconciler + WorkspaceManager: Substrate side of task lifecycle and workspace snapshot tags; reconciler_test.go is the test template
 internal/lifecycle     Pure Task lifecycle contract (State, Input, TransitionFunc, NextReconcileAt) and action queue types
-internal/reconciler    Leased Task action-queue worker pool, inline executor, admission control, and Substrate runtime adapter
+internal/reconciler    Leased Task action-queue worker pool, inline executor, sharded actor drift sweep, batched runner heartbeats, admission control, and Substrate runtime adapter
 internal/resources     Kubernetes CPU/memory resource quantity parsing
 internal/server        gRPC handlers
-internal/store/        memory + postgres backends, plus TaskApplier and TaskQueue contracts (schema.sql and schema.go change together)
+internal/store/        memory + postgres backends, plus TaskApplier, TaskQueue, and TaskSweepStore contracts (schema.sql and schema.go change together)
 internal/substrate     The only place that talks to the Substrate Control API
 internal/workspace     spec.setup execution (git clone / inline files / skills dir / commands; MCP is read via metadata server)
 internal/{tunnel,guest,metadata}  k8s port-forward, in-sandbox guest client, metadata server
@@ -84,7 +84,7 @@ location is where to look. How-to lives in the skills.
   (`internal/metadata/server.go`, `cmd/ax/main.go`).
 - Unit tests run against in-process fakes: `mockControlServer`
   (`internal/controller/reconciler_test.go`) and `internal/substrate/substratetest`
-  (`internal/reconciler/reconciler_test.go`, `internal/reconciler/reconciler_postgres_test.go`, `internal/server/server_test.go`, `cmd/ax/main_test.go`).
+  (`internal/reconciler/reconciler_test.go`, `internal/reconciler/sweep_test.go`, `internal/reconciler/reconciler_postgres_test.go`, `internal/server/server_test.go`, `cmd/ax/main_test.go`).
 - `go.mod` has no `replace` directive; E2E installs Substrate at the `go.mod`
   version (`hack/setup-e2e-kind.sh`).
 

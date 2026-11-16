@@ -76,6 +76,11 @@ type RuntimeClient interface {
 	// GetActor fetches the current Actor state from Substrate.
 	GetActor(ctx context.Context, atespace, actorName string) (*ateapipb.Actor, error)
 
+	// ListActorsPage fetches a single page of Actors in atespace (or across all
+	// atespaces when atespace is empty) using pageSize and pageToken, returning
+	// the page items and nextPageToken (empty when no further pages remain).
+	ListActorsPage(ctx context.Context, atespace string, pageSize int32, pageToken string) (actors []*ateapipb.Actor, nextPageToken string, err error)
+
 	// GetActorEgressPolicy fetches the Actor's singleton EgressPolicy (returning
 	// codes.NotFound when none exists).
 	GetActorEgressPolicy(ctx context.Context, atespace, actorName string) (*ateapipb.EgressPolicy, error)
@@ -324,6 +329,17 @@ func (r *SubstrateRuntime) GetActor(ctx context.Context, atespace, actorName str
 		atespace = v1alpha1.DefaultAtespace
 	}
 	return r.client.GetActor(ctx, atespace, actorName)
+}
+
+// ListActorsPage fetches one page of Actors in atespace (or across all
+// atespaces when atespace is empty) under WithSingleAttempt so sweep monitoring
+// calls stay 1:1 with the monitoring QPS budget.
+func (r *SubstrateRuntime) ListActorsPage(ctx context.Context, atespace string, pageSize int32, pageToken string) ([]*ateapipb.Actor, string, error) {
+	ctx = substrate.WithSingleAttempt(ctx)
+	if pageSize <= 0 {
+		pageSize = substrate.DefaultListActorsPageSize
+	}
+	return r.client.ListActorsPage(ctx, atespace, pageSize, pageToken)
 }
 
 // GetActorEgressPolicy fetches an Actor's singleton EgressPolicy from Substrate.

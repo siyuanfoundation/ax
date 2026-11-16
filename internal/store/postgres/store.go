@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package postgres implements store.Store, store.TaskQueue, and lock.Locker on
-// PostgreSQL.
+// Package postgres implements store.Store, store.TaskQueue, store.TaskSweepStore,
+// and lock.Locker on PostgreSQL.
 //
 // Open takes a libpq-style connection URL; standard libpq environment
 // variables such as PGPASSWORD fill in what it leaves out.
@@ -65,9 +65,9 @@ type Options struct {
 	ApplyStatementTimeout time.Duration
 }
 
-// Store is a PostgreSQL implementation of store.Store and store.TaskQueue. It
-// is also a lock.Locker (see Lock) whose locks are shared by every ax-server
-// replica using the same database.
+// Store is a PostgreSQL implementation of store.Store, store.TaskQueue, and
+// store.TaskSweepStore. It is also a lock.Locker (see Lock) whose locks are
+// shared by every ax-server replica using the same database.
 type Store struct {
 	pool *pgxpool.Pool
 	opts Options
@@ -77,9 +77,10 @@ type Store struct {
 }
 
 var (
-	_ store.Store     = (*Store)(nil)
-	_ store.TaskQueue = (*Store)(nil)
-	_ lock.Locker     = (*Store)(nil)
+	_ store.Store          = (*Store)(nil)
+	_ store.TaskQueue      = (*Store)(nil)
+	_ store.TaskSweepStore = (*Store)(nil)
+	_ lock.Locker          = (*Store)(nil)
 )
 
 // Open connects to the database at connURL and creates any missing tables.

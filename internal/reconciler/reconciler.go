@@ -26,6 +26,11 @@
 // For M0 rollouts and operational fallback (--reconcile-mode=inline),
 // [Reconciler.ReconcileInline] runs the identical leased action executor
 // synchronously from request handlers without background polling.
+//
+// Alongside action execution, [Sweeper] runs a sharded background actor drift
+// sweep against Substrate's ListActors API and watermark-gated lost-runner
+// detector, while [HeartbeatBuffer] coalesces runner heartbeats in replica
+// memory and flushes them in batches alongside ax_replicas liveness watermarks.
 package reconciler
 
 import (
@@ -162,8 +167,10 @@ type Config struct {
 	// ActionKindLimits (default 128).
 	OtherActionKindLimit int
 
-	// MutatingQPS caps mutating Substrate RPCs issued by this replica (defaults
-	// to DefaultMutatingQPS; set < 0 to disable rate limiting in unit tests).
+	// MutatingQPS is the deployment-wide rate budget for mutating Substrate RPCs
+	// (defaults to DefaultMutatingQPS; used directly on a standalone replica and
+	// divided evenly across live replicas when ScaleForLiveReplicas / Sweeper is
+	// active; set < 0 to disable rate limiting in unit tests).
 	MutatingQPS float64
 	// MutatingBurst sets the token-bucket burst for MutatingQPS.
 	MutatingBurst int
@@ -208,20 +215,21 @@ type Reconciler struct {
 	defaultTagRes bool
 	extraRules    []*ateapipb.EgressRule
 
-	mode                Mode
-	workerID            string
-	leaseTTL            time.Duration
-	renewInterval       time.Duration
-	actionTimeout       time.Duration
-	pollInterval        time.Duration
-	batchSize           int
-	initialBackoff      time.Duration
-	maxBackoff          time.Duration
-	requeueDelay        time.Duration
-	maxTemplateSkewWait time.Duration
-	maxWorkspaceTagWait time.Duration
-	clock               func() time.Time
-	customClock         bool
+	mode                  Mode
+	workerID              string
+	leaseTTL              time.Duration
+	renewInterval         time.Duration
+	actionTimeout         time.Duration
+	pollInterval          time.Duration
+	batchSize             int
+	initialBackoff        time.Duration
+	maxBackoff            time.Duration
+	requeueDelay          time.Duration
+	maxTemplateSkewWait   time.Duration
+	maxWorkspaceTagWait   time.Duration
+	deploymentMutatingQPS float64
+	clock                 func() time.Time
+	customClock           bool
 
 	admission *admissionController
 	limiter   *rateLimiter
@@ -337,26 +345,27 @@ func New(queue store.TaskQueue, runtime RuntimeClient, cfg Config) *Reconciler {
 	}
 
 	r := &Reconciler{
-		queue:               queue,
-		runtime:             runtime,
-		transition:          transition,
-		tagResolve:          cfg.WorkspaceTagResolver,
-		defaultTagRes:       cfg.WorkspaceTagResolver == nil,
-		extraRules:          extraRules,
-		mode:                mode,
-		workerID:            workerID,
-		leaseTTL:            leaseTTL,
-		renewInterval:       renewInterval,
-		actionTimeout:       actionTimeout,
-		pollInterval:        pollInterval,
-		batchSize:           batchSize,
-		initialBackoff:      initialBackoff,
-		maxBackoff:          maxBackoff,
-		requeueDelay:        requeueDelay,
-		maxTemplateSkewWait: maxTemplateSkewWait,
-		maxWorkspaceTagWait: maxWorkspaceTagWait,
-		clock:               clock,
-		customClock:         customClock,
+		queue:                 queue,
+		runtime:               runtime,
+		transition:            transition,
+		tagResolve:            cfg.WorkspaceTagResolver,
+		defaultTagRes:         cfg.WorkspaceTagResolver == nil,
+		extraRules:            extraRules,
+		mode:                  mode,
+		workerID:              workerID,
+		leaseTTL:              leaseTTL,
+		renewInterval:         renewInterval,
+		actionTimeout:         actionTimeout,
+		pollInterval:          pollInterval,
+		batchSize:             batchSize,
+		initialBackoff:        initialBackoff,
+		maxBackoff:            maxBackoff,
+		requeueDelay:          requeueDelay,
+		maxTemplateSkewWait:   maxTemplateSkewWait,
+		maxWorkspaceTagWait:   maxWorkspaceTagWait,
+		deploymentMutatingQPS: qps,
+		clock:                 clock,
+		customClock:           customClock,
 		admission: newAdmissionController(
 			cfg.MaxInFlightTasks,
 			cfg.MaxInFlightPerAtespace,
@@ -383,6 +392,24 @@ func (r *Reconciler) Mode() Mode {
 // currently open.
 func (r *Reconciler) CircuitBreakerOpen() bool {
 	return r.breaker.IsOpen()
+}
+
+// ScaleForLiveReplicas divides the deployment-wide mutating Substrate QPS
+// budget evenly across max(liveReplicas, 1) live ax-server replicas.
+func (r *Reconciler) ScaleForLiveReplicas(liveReplicas int) {
+	if r.limiter == nil || r.deploymentMutatingQPS <= 0 {
+		return
+	}
+	r.limiter.SetQPS(r.deploymentMutatingQPS / float64(max(liveReplicas, 1)))
+}
+
+// EffectiveMutatingQPS returns this replica's current mutating Substrate QPS
+// limit (0 when rate limiting is disabled).
+func (r *Reconciler) EffectiveMutatingQPS() float64 {
+	if r.limiter == nil {
+		return 0
+	}
+	return r.limiter.QPS()
 }
 
 // Notify signals the background poller that one or more task rows are due now.

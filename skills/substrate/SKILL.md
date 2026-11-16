@@ -40,7 +40,8 @@ All Control API traffic goes through this package. It encapsulates:
   `BuildActorTemplate`, `EnsureActor`, `EnsureActorFromTag`, `EnsureTaskActor`,
   `IsUncommittedTaskActorOrphan`, `GetActorEgressPolicy`,
   `EnsureActorEgressPolicy`, `CreateTag`, `EnsureSnapshotTag`, `GetTag`,
-  `ListTags`, `DeleteTag`, `DeleteTagWithUID`, `SuspendActor`,
+  `ListTags`, `DeleteTag`, `DeleteTagWithUID`, `ListActors`, `ListActorsPage`,
+  `DefaultListActorsPageSize`, `SuspendActor`,
   `SuspendActorAndWaitForSnapshot`, `SuspendActorSync`, `ResumeActor`,
   `RevertActor`, `DeleteActor`, `DeleteActorWithUID`,
   `LatestDurableSnapshotGeneration`, `HasPendingSnapshotUpload`,
@@ -97,8 +98,8 @@ state transitions), `internal/reconciler/reconciler_test.go` (leased action
 queue reconciler), and `internal/reconciler/reconciler_postgres_test.go`
 (isolated-schema PostgreSQL + `substratetest` integration tests, gated on
 `AX_TEST_POSTGRES_URL`). `internal/reconciler/reconciler_test.go`,
-`internal/server/server_test.go`, and `cmd/ax/main_test.go` run against
-`internal/substrate/substratetest`, an in-memory fake of the same API (atespaces,
+`internal/reconciler/sweep_test.go`, `internal/server/server_test.go`, and
+`cmd/ax/main_test.go` run against `internal/substrate/substratetest`, an in-memory fake of the same API (atespaces,
 actor templates, actors, and tags).
 `internal/substrate/client_test.go` uses a client-side `mockControlClient`
 instead. No mocking library is in `go.mod`.

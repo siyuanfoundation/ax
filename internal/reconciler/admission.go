@@ -262,33 +262,84 @@ func (a *admissionController) kindBucket(kind lifecycle.ActionKind) (lifecycle.A
 // rateLimiter is a context-aware token-bucket limiter using only the Go
 // standard library. A non-positive qps disables limiting.
 type rateLimiter struct {
-	qps   float64
-	burst float64
+	baseBurst int
 
 	mu     sync.Mutex
+	qps    float64
+	burst  float64
 	tokens float64
 	last   time.Time
 }
 
 func newRateLimiter(qps float64, burst int) *rateLimiter {
 	if qps <= 0 {
-		return &rateLimiter{qps: 0}
+		return &rateLimiter{baseBurst: burst, qps: 0}
 	}
-	b := float64(burst)
-	if b < 1 {
-		b = max(1, min(qps, 50))
-	}
+	b := computeBurst(qps, burst)
 	return &rateLimiter{
-		qps:    qps,
-		burst:  b,
-		tokens: b,
-		last:   time.Now(),
+		baseBurst: burst,
+		qps:       qps,
+		burst:     b,
+		tokens:    b,
+		last:      time.Now(),
 	}
+}
+
+func computeBurst(qps float64, configured int) float64 {
+	if configured >= 1 {
+		return float64(configured)
+	}
+	return max(1, min(qps, 50))
+}
+
+// SetQPS dynamically updates the token-bucket refill rate (for example when
+// live replica count changes in ax_replicas). A non-positive qps disables
+// rate limiting.
+func (l *rateLimiter) SetQPS(qps float64) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if qps > 0 && l.qps == qps {
+		return
+	}
+
+	now := time.Now()
+	if l.qps > 0 && !l.last.IsZero() {
+		if elapsed := now.Sub(l.last).Seconds(); elapsed > 0 {
+			l.tokens = min(l.burst, l.tokens+elapsed*l.qps)
+		}
+	}
+	l.last = now
+	if qps <= 0 {
+		l.qps = 0
+		return
+	}
+	wasDisabled := l.qps <= 0
+	l.qps = qps
+	l.burst = computeBurst(qps, l.baseBurst)
+	if wasDisabled {
+		l.tokens = l.burst
+	} else {
+		l.tokens = min(l.tokens, l.burst)
+	}
+}
+
+// QPS returns the limiter's current refill rate.
+func (l *rateLimiter) QPS() float64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.qps
 }
 
 // Wait blocks until one token is available or ctx is canceled.
 func (l *rateLimiter) Wait(ctx context.Context) error {
-	if l == nil || l.qps <= 0 {
+	if l == nil {
 		return ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
@@ -296,15 +347,20 @@ func (l *rateLimiter) Wait(ctx context.Context) error {
 	}
 
 	l.mu.Lock()
+	if l.qps <= 0 {
+		l.mu.Unlock()
+		return ctx.Err()
+	}
+	qps := l.qps
 	now := time.Now()
 	if elapsed := now.Sub(l.last).Seconds(); elapsed > 0 {
-		l.tokens = min(l.burst, l.tokens+elapsed*l.qps)
+		l.tokens = min(l.burst, l.tokens+elapsed*qps)
 		l.last = now
 	}
 	nextTokens := l.tokens - 1.0
 	var waitDur time.Duration
 	if nextTokens < 0 {
-		waitNs := (-nextTokens / l.qps) * float64(time.Second)
+		waitNs := (-nextTokens / qps) * float64(time.Second)
 		if waitNs >= float64(math.MaxInt64) {
 			waitDur = time.Duration(math.MaxInt64)
 		} else {
@@ -334,11 +390,13 @@ func (l *rateLimiter) Wait(ctx context.Context) error {
 		// waiters behind us nor subsequent callers forfeit unconsumed QPS.
 		l.mu.Lock()
 		refundNow := time.Now()
-		if elapsed := refundNow.Sub(l.last).Seconds(); elapsed > 0 {
-			l.tokens = min(l.burst, l.tokens+elapsed*l.qps)
-			l.last = refundNow
+		if l.qps > 0 {
+			if elapsed := refundNow.Sub(l.last).Seconds(); elapsed > 0 {
+				l.tokens = min(l.burst, l.tokens+elapsed*l.qps)
+				l.last = refundNow
+			}
+			l.tokens = min(l.burst, l.tokens+1.0)
 		}
-		l.tokens = min(l.burst, l.tokens+1.0)
 		l.mu.Unlock()
 		return ctx.Err()
 	}

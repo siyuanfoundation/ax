@@ -61,6 +61,9 @@ type mockControlClient struct {
 	revertResp          *ateapipb.RevertActorResponse
 	getActorOverride    *ateapipb.Actor
 	getActorOverrideErr error
+	listActorPages      map[string]*ateapipb.ListActorsResponse
+	listActorErrs       []error
+	listActorReqs       []*ateapipb.ListActorsRequest
 }
 
 func (m *mockControlClient) CreateActorEgressPolicy(ctx context.Context, req *ateapipb.CreateActorEgressPolicyRequest, opts ...grpc.CallOption) (*ateapipb.EgressPolicy, error) {
@@ -270,6 +273,24 @@ func (m *mockControlClient) DeleteTag(ctx context.Context, req *ateapipb.DeleteT
 	}
 	delete(m.tags, key)
 	return tag, nil
+}
+
+func (m *mockControlClient) ListActors(ctx context.Context, req *ateapipb.ListActorsRequest, opts ...grpc.CallOption) (*ateapipb.ListActorsResponse, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.listActorReqs = append(m.listActorReqs, proto.Clone(req).(*ateapipb.ListActorsRequest))
+	if len(m.listActorErrs) > 0 {
+		err := m.listActorErrs[0]
+		m.listActorErrs = m.listActorErrs[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	tok := req.GetOptions().GetPageToken()
+	if resp, ok := m.listActorPages[tok]; ok {
+		return proto.Clone(resp).(*ateapipb.ListActorsResponse), nil
+	}
+	return &ateapipb.ListActorsResponse{}, nil
 }
 
 func TestClient_DeleteActor_AnyStateTrue(t *testing.T) {
@@ -1111,6 +1132,45 @@ func TestClient_SuspendSyncRevertAndEnsureSnapshotTag(t *testing.T) {
 
 		if _, err := c.EnsureSnapshotTag(ctx, "default", "tag-other", "actor-1"); status.Code(err) != codes.AlreadyExists {
 			t.Fatalf("EnsureSnapshotTag(other owner) = %v, want AlreadyExists", err)
+		}
+	})
+
+	t.Run("ListActorsPage and ListActors paginate across pages", func(t *testing.T) {
+		mock := &mockControlClient{
+			listActorErrs: []error{status.Error(codes.Unavailable, "transient"), nil, nil},
+			listActorPages: map[string]*ateapipb.ListActorsResponse{
+				"": {
+					Actors: []*ateapipb.Actor{
+						{Metadata: &ateapipb.ResourceMetadata{Atespace: "payments", Name: "a1"}},
+						{Metadata: &ateapipb.ResourceMetadata{Atespace: "payments", Name: "a2"}},
+					},
+					NextPageToken: "tok-2",
+				},
+				"tok-2": {
+					Actors: []*ateapipb.Actor{
+						{Metadata: &ateapipb.ResourceMetadata{Atespace: "payments", Name: "a3"}},
+					},
+				},
+			},
+		}
+		c := &Client{control: mock}
+
+		all, err := c.ListActors(ctx, "payments")
+		if err != nil || len(all) != 3 {
+			t.Fatalf("ListActors = (%d actors, %v), want (3, nil)", len(all), err)
+		}
+		if len(mock.listActorReqs) != 3 || mock.listActorReqs[0].GetOptions().GetPageSize() != DefaultListActorsPageSize {
+			t.Fatalf("unexpected ListActors requests: %+v", mock.listActorReqs)
+		}
+
+		// Explicit pageSize and global atespace ("") pass through unchanged.
+		page, nextTok, err := c.ListActorsPage(WithSingleAttempt(ctx), "", 2, "")
+		if err != nil || len(page) != 2 || nextTok != "tok-2" {
+			t.Fatalf("ListActorsPage = (%d, %q, %v), want (2, tok-2, nil)", len(page), nextTok, err)
+		}
+		lastReq := mock.listActorReqs[len(mock.listActorReqs)-1]
+		if lastReq.GetAtespace() != "" || lastReq.GetOptions().GetPageSize() != 2 {
+			t.Fatalf("unexpected ListActorsPage request: %+v", lastReq)
 		}
 	})
 }

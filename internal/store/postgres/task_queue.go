@@ -33,6 +33,7 @@ import (
 
 const (
 	pgCodeUniqueViolation  = "23505"
+	pgCodeDeadlockDetected = "40P01"
 	pgCodeLockNotAvailable = "55P03"
 	pgCodeQueryCanceled    = "57014"
 
@@ -99,9 +100,10 @@ func queryClockTimestamp(ctx context.Context, tx pgx.Tx) (time.Time, error) {
 	return now.UTC(), nil
 }
 
-// classifyTxError maps PostgreSQL lock_timeout (55P03) and statement_timeout
-// (57014 when the caller's context was not itself canceled) to
-// store.ErrLockTimeout so callers can treat contention as retryable.
+// classifyTxError maps PostgreSQL lock_timeout (55P03), deadlock_detected
+// (40P01), and statement_timeout (57014 when the caller's context was not
+// itself canceled) to store.ErrLockTimeout so callers can treat contention as
+// retryable.
 func classifyTxError(ctx context.Context, err error) error {
 	if err == nil {
 		return nil
@@ -109,7 +111,7 @@ func classifyTxError(ctx context.Context, err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
-		case pgCodeLockNotAvailable:
+		case pgCodeLockNotAvailable, pgCodeDeadlockDetected:
 			return fmt.Errorf("%w: %w", store.ErrLockTimeout, err)
 		case pgCodeQueryCanceled:
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -517,6 +519,17 @@ func (s *Store) applyOnce(ctx context.Context, key store.TaskKey, fn store.Apply
 	if written.ClaimDeadline != nil {
 		cd := written.ClaimDeadline.UTC().Truncate(time.Microsecond)
 		written.ClaimDeadline = &cd
+	}
+	// Whenever an update transitions a task into steady-state runner heartbeat
+	// monitoring (whether via ClaimAssignment clearing ClaimDeadline, a direct
+	// atenet-router wakeup from IDLE/SUSPENDED, or a /readyz doorbell claim
+	// arriving ahead of ActionCompleted(RESUME_ACTOR)), stamp LastHeartbeatAt =
+	// &now so the task gets a full silence window before its next 30s flush.
+	if stored != nil && !store.RowExpectsHeartbeats(stored) && store.RowExpectsHeartbeats(written) {
+		nowMicro := now.UTC().Truncate(time.Microsecond)
+		if written.LastHeartbeatAt == nil || written.LastHeartbeatAt.Before(nowMicro) {
+			written.LastHeartbeatAt = &nowMicro
+		}
 	}
 	written.NextReconcileAt = lifecycle.NextReconcileAt(written.LifecycleState(), now)
 

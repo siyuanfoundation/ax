@@ -46,7 +46,7 @@ func openTest(t *testing.T, opts Options) *Store {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if _, err := s.pool.Exec(ctx, `TRUNCATE tasks, workspaces, gateways, models, locks`); err != nil {
+	if _, err := s.pool.Exec(ctx, `TRUNCATE tasks, workspaces, gateways, models, locks, ax_replicas`); err != nil {
 		t.Fatalf("truncating tables: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
@@ -56,7 +56,7 @@ func openTest(t *testing.T, opts Options) *Store {
 func TestCreateSchemaConcurrent(t *testing.T) {
 	s := openTest(t, Options{})
 	ctx := context.Background()
-	if _, err := s.pool.Exec(ctx, `DROP TABLE tasks, workspaces, gateways, models, locks`); err != nil {
+	if _, err := s.pool.Exec(ctx, `DROP TABLE tasks, workspaces, gateways, models, locks, ax_replicas`); err != nil {
 		t.Fatal(err)
 	}
 	// Simulate several replicas starting at once.

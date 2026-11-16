@@ -188,7 +188,11 @@ var DeleteTaskRow = &TaskRow{}
 //     which moves updated tasks to the front);
 //   - clears any expired worker lease (LeaseExpiresAt <= now);
 //   - clamps NextReconcileAt to at least LeaseExpiresAt while an active lease
-//     is held, preventing another worker from claiming the row early.
+//     is held, preventing another worker from claiming the row early;
+//   - stamps LastHeartbeatAt to at least now whenever an update transitions the
+//     row into steady-state runner heartbeat monitoring ([RowExpectsHeartbeats])
+//     so claims, router wakeups, and doorbell resumes start with a fresh
+//     silence baseline.
 type ApplyFunc func(current *TaskRow, now time.Time) (*TaskRow, error)
 
 // TaskApplier is the transactional write interface for task rows. New task

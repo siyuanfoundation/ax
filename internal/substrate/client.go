@@ -1058,23 +1058,59 @@ func (c *Client) GetActor(ctx context.Context, atespace, actorName string) (*ate
 	})
 }
 
+const (
+	// DefaultListActorsPageSize is the page size (1,000 actors) used by the
+	// background actor drift sweep so 100,000 actors across a cluster require
+	// ~100 pages per 15s pass (~6.7 QPS, well within the 25 QPS budget).
+	DefaultListActorsPageSize int32 = 1000
+)
+
+// ListActorsPage fetches a single page of Actors in atespace (or across all
+// atespaces when atespace is empty), returning the page items and
+// nextPageToken (empty when no further pages remain).
+func (c *Client) ListActorsPage(ctx context.Context, atespace string, pageSize int32, pageToken string) ([]*ateapipb.Actor, string, error) {
+	if pageSize <= 0 {
+		pageSize = DefaultListActorsPageSize
+	}
+	opts := &ateapipb.ListOptions{
+		PageSize:  pageSize,
+		PageToken: pageToken,
+	}
+	req := &ateapipb.ListActorsRequest{
+		Atespace: atespace,
+		Options:  opts,
+	}
+	resp, err := callWithRetry(ctx, func() (*ateapipb.ListActorsResponse, error) {
+		return c.control.ListActors(ctx, req)
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("listing actors in %q: %w", atespace, err)
+	}
+	return resp.GetActors(), resp.GetNextPageToken(), nil
+}
+
 // ListActors returns every Actor in the given atespace, or in all atespaces
 // when atespace is empty.
 func (c *Client) ListActors(ctx context.Context, atespace string) ([]*ateapipb.Actor, error) {
-	var actors []*ateapipb.Actor
-	req := &ateapipb.ListActorsRequest{Atespace: atespace, Options: &ateapipb.ListOptions{}}
+	var (
+		actors    []*ateapipb.Actor
+		pageToken string
+	)
+	seenTokens := map[string]struct{}{"": {}}
 	for {
-		resp, err := callWithRetry(ctx, func() (*ateapipb.ListActorsResponse, error) {
-			return c.control.ListActors(ctx, req)
-		})
+		page, nextToken, err := c.ListActorsPage(ctx, atespace, 0, pageToken)
 		if err != nil {
-			return nil, fmt.Errorf("listing actors in %q: %w", atespace, err)
+			return nil, err
 		}
-		actors = append(actors, resp.GetActors()...)
-		if resp.GetNextPageToken() == "" {
+		actors = append(actors, page...)
+		if nextToken == "" {
 			return actors, nil
 		}
-		req.Options.PageToken = resp.GetNextPageToken()
+		if _, dup := seenTokens[nextToken]; dup {
+			return nil, fmt.Errorf("listing actors in %q returned cyclic page token %q", atespace, nextToken)
+		}
+		seenTokens[nextToken] = struct{}{}
+		pageToken = nextToken
 	}
 }
 

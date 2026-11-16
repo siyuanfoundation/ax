@@ -51,33 +51,51 @@ func clone[T proto.Message](m T) T {
 	return proto.Clone(m).(T)
 }
 
-// MemoryStore is an in-memory implementation of store.Store and store.TaskQueue
-// for testing and single-node setups.
+type replicaEntry struct {
+	startedAt   time.Time
+	lastFlushAt time.Time
+	expiresAt   time.Time
+}
+
+type shardLeaseEntry struct {
+	token     string
+	expiresAt time.Time
+}
+
+// MemoryStore is an in-memory implementation of store.Store, store.TaskQueue,
+// and store.TaskSweepStore for testing and single-node setups.
 type MemoryStore struct {
-	mu         sync.RWMutex
-	tasks      map[string]*store.TaskRow
-	models     map[string]*v1alpha1.Model
-	workspaces map[string]*v1alpha1.Workspace
-	gateways   map[string]*v1alpha1.Gateway
-	clock      func() time.Time
+	mu          sync.RWMutex
+	tasks       map[string]*store.TaskRow
+	taskSavedAt map[string]time.Time
+	models      map[string]*v1alpha1.Model
+	workspaces  map[string]*v1alpha1.Workspace
+	gateways    map[string]*v1alpha1.Gateway
+	replicas    map[string]replicaEntry
+	shardLeases map[string]shardLeaseEntry
+	clock       func() time.Time
 
 	wakeupMu sync.RWMutex
 	wakeup   func()
 }
 
 var (
-	_ store.Store     = (*MemoryStore)(nil)
-	_ store.TaskQueue = (*MemoryStore)(nil)
+	_ store.Store          = (*MemoryStore)(nil)
+	_ store.TaskQueue      = (*MemoryStore)(nil)
+	_ store.TaskSweepStore = (*MemoryStore)(nil)
 )
 
 // NewStore creates a new in-memory Store.
 func NewStore(opts ...Option) *MemoryStore {
 	s := &MemoryStore{
-		tasks:      make(map[string]*store.TaskRow),
-		models:     make(map[string]*v1alpha1.Model),
-		workspaces: make(map[string]*v1alpha1.Workspace),
-		gateways:   make(map[string]*v1alpha1.Gateway),
-		clock:      time.Now,
+		tasks:       make(map[string]*store.TaskRow),
+		taskSavedAt: make(map[string]time.Time),
+		models:      make(map[string]*v1alpha1.Model),
+		workspaces:  make(map[string]*v1alpha1.Workspace),
+		gateways:    make(map[string]*v1alpha1.Gateway),
+		replicas:    make(map[string]replicaEntry),
+		shardLeases: make(map[string]shardLeaseEntry),
+		clock:       time.Now,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -164,6 +182,7 @@ func (s *MemoryStore) SaveTask(ctx context.Context, task *v1alpha1.Task) error {
 			State:      lifecycle.State{Task: cp},
 			Generation: cp.Status.Generation,
 		}
+		s.taskSavedAt[key] = s.now()
 	}
 	s.mu.Unlock()
 
@@ -255,7 +274,9 @@ func (s *MemoryStore) SetTaskDeleteTime(ctx context.Context, atespace, name stri
 func (s *MemoryStore) DeleteTask(ctx context.Context, atespace, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.tasks, taskKey(atespace, name))
+	k := taskKey(atespace, name)
+	delete(s.tasks, k)
+	delete(s.taskSavedAt, k)
 	return nil
 }
 

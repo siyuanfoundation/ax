@@ -98,3 +98,14 @@ CREATE TABLE IF NOT EXISTS locks (
     token      text        NOT NULL,
     expires_at timestamptz NOT NULL
 );
+
+-- Replica registry: tracks live ax-server replicas and their latest runner
+-- heartbeat flush timestamps so the drift sweep can scale mutating QPS across
+-- live replicas, balance sweep shards, and gate lost-runner detection on the
+-- cluster-wide heartbeat watermark.
+CREATE TABLE IF NOT EXISTS ax_replicas (
+    replica_id    text        PRIMARY KEY,
+    started_at    timestamptz NOT NULL,
+    last_flush_at timestamptz NOT NULL,
+    expires_at    timestamptz NOT NULL
+);

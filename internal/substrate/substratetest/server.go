@@ -19,6 +19,7 @@ package substratetest
 import (
 	"context"
 	"net"
+	"sort"
 	"sync"
 	"testing"
 
@@ -43,6 +44,7 @@ type Errors struct {
 	ResumeActor        error
 	RevertActor        error
 	DeleteActor        error
+	ListActors         error
 	CreateTag          error
 	DeleteTag          error
 }
@@ -539,11 +541,49 @@ func (s *Server) GetActor(_ context.Context, req *ateapipb.GetActorRequest) (*at
 func (s *Server) ListActors(_ context.Context, req *ateapipb.ListActorsRequest) (*ateapipb.ListActorsResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	resp := &ateapipb.ListActorsResponse{}
+	if s.errs.ListActors != nil {
+		return nil, s.errs.ListActors
+	}
+
+	type keyedActor struct {
+		k     string
+		actor *ateapipb.Actor
+	}
+	var all []keyedActor
 	for _, actor := range s.actors {
 		if req.GetAtespace() == "" || actor.GetMetadata().GetAtespace() == req.GetAtespace() {
-			resp.Actors = append(resp.Actors, proto.Clone(actor).(*ateapipb.Actor))
+			k := key(actor.GetMetadata().GetAtespace(), actor.GetMetadata().GetName())
+			all = append(all, keyedActor{
+				k:     k,
+				actor: proto.Clone(actor).(*ateapipb.Actor),
+			})
 		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].k < all[j].k
+	})
+
+	startToken := req.GetOptions().GetPageToken()
+	startIdx := 0
+	if startToken != "" {
+		startIdx = sort.Search(len(all), func(i int) bool {
+			return all[i].k > startToken
+		})
+	}
+	remaining := all[startIdx:]
+	pageSize := int(req.GetOptions().GetPageSize())
+	var nextToken string
+	if pageSize > 0 && len(remaining) > pageSize {
+		nextToken = remaining[pageSize-1].k
+		remaining = remaining[:pageSize]
+	}
+
+	resp := &ateapipb.ListActorsResponse{
+		Actors:        make([]*ateapipb.Actor, len(remaining)),
+		NextPageToken: nextToken,
+	}
+	for i, item := range remaining {
+		resp.Actors[i] = item.actor
 	}
 	return resp, nil
 }

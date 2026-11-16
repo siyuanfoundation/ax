@@ -268,3 +268,152 @@ func TestReconciler_PostgresIntegrationLeaseFailoverAndObsoleteCancel(t *testing
 		t.Fatalf("Postgres HasActiveLease transitions = %d, want 1", got)
 	}
 }
+
+func TestReconciler_PostgresEndToEndSweepAndHeartbeats(t *testing.T) {
+	pgStore := openIsolatedPostgresStore(t)
+	sub := substratetest.NewServer(t)
+	rt := reconciler.NewSubstrateRuntime(sub.Client(), reconciler.SubstrateRuntimeOptions{
+		DefaultTaskImage: "us-docker.pkg.dev/acme/agent@sha256:abcdef",
+	})
+	ctx := t.Context()
+
+	prof := &v1alpha1.Profile{Image: "us-docker.pkg.dev/acme/agent@sha256:abcdef"}
+	tmplName, _, err := controller.ResolveProfileTemplate("payments", prof, "", "")
+	if err != nil {
+		t.Fatalf("ResolveProfileTemplate: %v", err)
+	}
+
+	hb := reconciler.NewHeartbeatBuffer(pgStore, reconciler.HeartbeatConfig{
+		ReplicaID:     "pg-rep-1",
+		FlushInterval: 40 * time.Millisecond,
+		ReplicaTTL:    45 * time.Second,
+	})
+	rec := reconciler.New(pgStore, rt, reconciler.Config{
+		Mode:         reconciler.ModeQueue,
+		WorkerID:     "pg-worker-1",
+		Transition:   stubTransition,
+		PollInterval: 20 * time.Millisecond,
+		MutatingQPS:  -1,
+	})
+	sweeper := reconciler.NewSweeper(pgStore, rt, reconciler.SweepConfig{
+		ReplicaID:            "pg-rep-1",
+		Reconciler:           rec,
+		HeartbeatBuffer:      hb,
+		Transition:           stubTransition,
+		SweepInterval:        50 * time.Millisecond,
+		NumShards:            4,
+		RunnerSilenceTimeout: 750 * time.Millisecond,
+		MaxWatermarkAge:      250 * time.Millisecond,
+		MonitoringQPS:        -1,
+	})
+
+	runCtx, cancel := context.WithCancel(ctx)
+	doneCh := make(chan struct{}, 3)
+	go func() { _ = hb.Run(runCtx); doneCh <- struct{}{} }()
+	go func() { _ = rec.Run(runCtx); doneCh <- struct{}{} }()
+	go func() { _ = sweeper.Run(runCtx); doneCh <- struct{}{} }()
+	t.Cleanup(func() {
+		cancel()
+		for range 3 {
+			<-doneCh
+		}
+	})
+
+	provisionTask := func(name string, tok []byte) store.TaskKey {
+		key := store.TaskKey{Atespace: "payments", Name: name}
+		if _, err := pgStore.Apply(ctx, key, func(_ *store.TaskRow, now time.Time) (*store.TaskRow, error) {
+			st := lifecycle.State{
+				Task: &v1alpha1.Task{
+					Metadata: &v1alpha1.ObjectMeta{CreateTime: timestamppb.New(now)},
+					Status: &v1alpha1.TaskStatus{
+						State:            v1alpha1.TaskState_TASK_STATE_WORKING,
+						AteActorTemplate: tmplName,
+						Attempt:          1,
+					},
+				},
+				RunnerTokenHash:      tok,
+				RunnerTokenConfirmed: true,
+			}
+			st.Actions = []lifecycle.Action{
+				st.NextAction(lifecycle.ActionEnsureTemplate, now),
+				st.NextAction(lifecycle.ActionCreateActor, now),
+				st.NextAction(lifecycle.ActionResumeActor, now),
+			}
+			row := &store.TaskRow{EffectiveProfile: prof}
+			row.SetLifecycleState(st, now)
+			return row, nil
+		}); err != nil {
+			t.Fatalf("Apply(%s): %v", name, err)
+		}
+		waitFor(t, 3*time.Second, func() bool {
+			r, gErr := pgStore.GetTaskRow(ctx, key)
+			return gErr == nil && len(r.Actions) == 0 && r.ActorUID != ""
+		})
+		return key
+	}
+
+	tokAlive := []byte{0x11, 0x22}
+	tokSilent := []byte{0x33, 0x44}
+	aliveKey := provisionTask("pg-alive-task", tokAlive)
+	silentKey := provisionTask("pg-silent-task", tokSilent)
+
+	// Keep aliveKey heartbeating every 25ms in the background while silentKey goes silent.
+	hbStop := make(chan struct{})
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			hb.Record(aliveKey, tokAlive)
+			select {
+			case <-hbStop:
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	defer func() {
+		close(hbStop)
+		<-hbDone
+	}()
+
+	// Wait for silentKey to be detected lost via watermark-gated sweep and parked on Substrate.
+	waitFor(t, 4*time.Second, func() bool {
+		r, gErr := pgStore.GetTaskRow(ctx, silentKey)
+		if gErr != nil || r.Task.GetStatus().GetState() != v1alpha1.TaskState_TASK_STATE_FAILED || len(r.Actions) != 0 {
+			return false
+		}
+		actor, ok := sub.Actor("payments", "pg-silent-task")
+		return ok && actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_SUSPENDED
+	})
+
+	// Verify aliveKey remained WORKING throughout!
+	aliveRow, err := pgStore.GetTaskRow(ctx, aliveKey)
+	if err != nil || aliveRow.Task.GetStatus().GetState() != v1alpha1.TaskState_TASK_STATE_WORKING {
+		t.Fatalf("alive heartbeating task state = %v (err=%v), want WORKING", aliveRow.Task.GetStatus().GetState(), err)
+	}
+
+	// Simulate sandbox crash on aliveKey -> Sweeper enqueues REVERT_ACTOR + RESUME_ACTOR -> Reconciler recovers it to RUNNING!
+	sub.SetActor(&ateapipb.Actor{
+		Metadata:      &ateapipb.ResourceMetadata{Atespace: "payments", Name: "pg-alive-task", Uid: aliveRow.ActorUID},
+		ActorTemplate: &ateapipb.ObjectRef{Atespace: "payments", Name: tmplName},
+		Status: &ateapipb.ActorStatus{
+			State:                  ateapipb.ActorState_ACTOR_STATE_CRASHED,
+			LastAssignedGeneration: 1,
+			Snapshots: []*ateapipb.Snapshot{{
+				Generation:      1,
+				Owner:           ateapipb.SnapshotOwner_SNAPSHOT_OWNER_TAG,
+				DurableSnapshot: &ateapipb.SnapshotStorage{State: ateapipb.SnapshotStorageState_SNAPSHOT_STORAGE_STATE_COMPLETED},
+			}},
+		},
+	})
+	waitFor(t, 4*time.Second, func() bool {
+		r, gErr := pgStore.GetTaskRow(ctx, aliveKey)
+		if gErr != nil || r.Task.GetStatus().GetAttempt() < 2 || len(r.Actions) != 0 {
+			return false
+		}
+		actor, ok := sub.Actor("payments", "pg-alive-task")
+		return ok && actor.GetStatus().GetState() == ateapipb.ActorState_ACTOR_STATE_RUNNING
+	})
+}

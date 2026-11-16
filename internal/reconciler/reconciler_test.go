@@ -129,9 +129,14 @@ func stubTransition(state lifecycle.State, in lifecycle.Input, now time.Time) (l
 			next.Actions = nil
 			next.ActorUID = ""
 			next.Task.Status.State = v1alpha1.TaskState_TASK_STATE_FAILED
+			next.Task.Status.StatusDetail = &v1alpha1.TaskStatusDetail{
+				Reason: v1alpha1.TaskStatusReason_TASK_STATUS_REASON_SANDBOX_CRASHED,
+				Detail: "actor confirmed missing on Substrate",
+			}
 			return next, lifecycle.Output{}, nil
 		}
-		if ev.ActorState == ateapipb.ActorState_ACTOR_STATE_CRASHED {
+		switch ev.ActorState {
+		case ateapipb.ActorState_ACTOR_STATE_CRASHED:
 			curState := next.Task.Status.State
 			if lifecycle.IsTerminal(curState) || curState == v1alpha1.TaskState_TASK_STATE_IDLE {
 				next.Actions = []lifecycle.Action{next.NextAction(lifecycle.ActionRevertActor, now)}
@@ -142,7 +147,44 @@ func stubTransition(state lifecycle.State, in lifecycle.Input, now time.Time) (l
 			next.Actions = []lifecycle.Action{rev, res}
 			next.Task.Status.State = v1alpha1.TaskState_TASK_STATE_QUEUED
 			next.Task.Status.Attempt++
+		case ateapipb.ActorState_ACTOR_STATE_RUNNING:
+			curState := next.Task.Status.State
+			switch {
+			case curState == v1alpha1.TaskState_TASK_STATE_SUSPENDED:
+				next.Task.Status.State = v1alpha1.TaskState_TASK_STATE_QUEUED
+				resumed := now
+				next.LastResumedAt = &resumed
+				dl := now.Add(lifecycle.ClaimWatchdogTimeout)
+				next.ClaimDeadline = &dl
+			case curState == v1alpha1.TaskState_TASK_STATE_IDLE:
+				next.Task.Status.State = v1alpha1.TaskState_TASK_STATE_SUSPENDING
+				sus := next.NextAction(lifecycle.ActionSuspendActorSync, now)
+				sus.SuspendReason = lifecycle.SuspendReasonTurnIdle
+				next.Actions = []lifecycle.Action{sus}
+			case lifecycle.IsTerminal(curState):
+				sus := next.NextAction(lifecycle.ActionSuspendActorSync, now)
+				sus.SuspendReason = lifecycle.SuspendReasonTerminal
+				next.Actions = []lifecycle.Action{sus}
+			}
+		case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
+			if next.Task.Status.State == v1alpha1.TaskState_TASK_STATE_WORKING ||
+				next.Task.Status.State == v1alpha1.TaskState_TASK_STATE_QUEUED {
+				next.ClaimDeadline = nil
+				next.Task.Status.State = v1alpha1.TaskState_TASK_STATE_SUSPENDED
+			}
 		}
+		return next, lifecycle.Output{}, nil
+
+	case *lifecycle.HeartbeatLostInput:
+		next.ClaimDeadline = nil
+		next.Task.Status.State = v1alpha1.TaskState_TASK_STATE_FAILED
+		next.Task.Status.StatusDetail = &v1alpha1.TaskStatusDetail{
+			Reason: v1alpha1.TaskStatusReason_TASK_STATUS_REASON_SANDBOX_CRASHED,
+			Detail: "runner heartbeat silence exceeded threshold",
+		}
+		sus := next.NextAction(lifecycle.ActionSuspendActorSync, now)
+		sus.SuspendReason = lifecycle.SuspendReasonTerminal
+		next.Actions = []lifecycle.Action{sus}
 		return next, lifecycle.Output{}, nil
 
 	case *lifecycle.TimerExpiredInput:
@@ -225,6 +267,10 @@ func (g *noIOInTxGuard) DeleteSnapshotTag(ctx context.Context, ns, tag string) e
 func (g *noIOInTxGuard) GetActor(ctx context.Context, ns, actor string) (*ateapipb.Actor, error) {
 	g.checkNoTx("GetActor")
 	return g.RuntimeClient.GetActor(ctx, ns, actor)
+}
+func (g *noIOInTxGuard) ListActorsPage(ctx context.Context, ns string, pageSize int32, pageToken string) ([]*ateapipb.Actor, string, error) {
+	g.checkNoTx("ListActorsPage")
+	return g.RuntimeClient.ListActorsPage(ctx, ns, pageSize, pageToken)
 }
 func (g *noIOInTxGuard) GetActorEgressPolicy(ctx context.Context, ns, actor string) (*ateapipb.EgressPolicy, error) {
 	g.checkNoTx("GetActorEgressPolicy")
