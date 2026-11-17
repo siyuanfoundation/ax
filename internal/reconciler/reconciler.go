@@ -41,7 +41,6 @@ import (
 
 	"github.com/google/ax/internal/lifecycle"
 	"github.com/google/ax/internal/store"
-	"github.com/google/ax/internal/substrate"
 	"github.com/google/ax/pkg/apis/v1alpha1"
 	"github.com/google/uuid"
 	ateapipb "go.ate.dev/substrate/api/ateapi/v1"
@@ -141,9 +140,10 @@ type Reconciler struct {
 	maxBackoff          time.Duration
 	maxWorkspaceTagWait time.Duration
 
-	sem    chan struct{}
-	wakeCh chan struct{}
-	wg     sync.WaitGroup
+	sem       chan struct{}
+	wakeCh    chan struct{}
+	wg        sync.WaitGroup
+	executors map[lifecycle.ActionKind]ActionExecutor
 }
 
 // New constructs a [Reconciler] over queue and runtime.
@@ -231,6 +231,7 @@ func New(queue store.TaskQueue, runtime RuntimeClient, cfg Config) *Reconciler {
 	if r.tagResolve == nil {
 		r.tagResolve = r.defaultResolveWorkspaceTag
 	}
+	r.executors = defaultExecutors(r)
 	return r
 }
 
@@ -614,239 +615,8 @@ func (r *Reconciler) runWithLeaseRenewal(
 }
 
 func (r *Reconciler) executeAction(parentCtx, ctx context.Context, key store.TaskKey, row *store.TaskRow, action lifecycle.Action, storeNow time.Time) actionExecOutcome {
-	atespace := key.Atespace
-	actorName := key.Name
-	templateName := row.Task.GetStatus().GetAteActorTemplate()
-
-	switch action.Kind {
-	case lifecycle.ActionWaitWorkspaceTag:
-		wsName := row.Task.GetSpec().GetWorkspace().GetName()
-		tag, ready, err := r.tagResolve(ctx, atespace, wsName, templateName, action.Tag)
-		if err != nil {
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		if !ready {
-			if !action.Since.IsZero() && storeNow.Sub(action.Since) >= r.maxWorkspaceTagWait {
-				return actionExecOutcome{
-					kind: outcomePermanentFailure,
-					input: &lifecycle.ActionFailedInput{
-						ActionID: action.ID,
-						Kind:     action.Kind,
-						Reason:   v1alpha1.TaskStatusReason_TASK_STATUS_REASON_PROVISIONING_FAILED,
-						Message:  fmt.Sprintf("timed out after %s waiting for Workspace snapshot tag %q", r.maxWorkspaceTagWait, action.Tag),
-					},
-				}
-			}
-			return actionExecOutcome{kind: outcomeTransientRetry}
-		}
-		if tag == "" {
-			tag = action.Tag
-		}
-		if tag == "" {
-			return actionExecOutcome{
-				kind: outcomePermanentFailure,
-				input: &lifecycle.ActionFailedInput{
-					ActionID: action.ID,
-					Kind:     action.Kind,
-					Reason:   v1alpha1.TaskStatusReason_TASK_STATUS_REASON_PROVISIONING_FAILED,
-					Message:  "WAIT_WORKSPACE_TAG resolved ready=true with an empty snapshot tag",
-				},
-			}
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID:  action.ID,
-				Kind:      action.Kind,
-				SourceTag: tag,
-			},
-		}
-
-	case lifecycle.ActionEnsureTemplate:
-		if err := r.runtime.EnsureTemplate(ctx, atespace, templateName, row.EffectiveProfile); err != nil {
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-			},
-		}
-
-	case lifecycle.ActionCreateActor:
-		uid, err := r.runtime.EnsureActor(ctx, atespace, actorName, templateName, action.Tag)
-		if err != nil {
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-				ActorUID: uid,
-			},
-		}
-
-	case lifecycle.ActionEnsureEgress:
-		rules := r.combinedEgressRules(row.EgressRules)
-		if len(rules) == 0 {
-			return actionExecOutcome{
-				kind: outcomeCompleted,
-				input: &lifecycle.ActionCompletedInput{
-					ActionID: action.ID,
-					Kind:     action.Kind,
-				},
-			}
-		}
-		if err := r.runtime.EnsureActorEgress(ctx, atespace, actorName, rules); err != nil {
-			if statusCode(err) == codes.NotFound && row.ActorUID != "" {
-				return actionExecOutcome{
-					kind:  outcomeObservedActor,
-					input: &lifecycle.ObservedActorInput{MissingConfirmed: true},
-				}
-			}
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-			},
-		}
-
-	case lifecycle.ActionResumeActor:
-		if err := r.runtime.ResumeActor(ctx, atespace, actorName); err != nil {
-			switch statusCode(err) {
-			case codes.FailedPrecondition:
-				return r.resolveResumePrecondition(parentCtx, ctx, key, row, action, err)
-			case codes.NotFound:
-				if row.ActorUID != "" {
-					return actionExecOutcome{
-						kind:  outcomeObservedActor,
-						input: &lifecycle.ObservedActorInput{MissingConfirmed: true},
-					}
-				}
-			}
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-			},
-		}
-
-	case lifecycle.ActionSuspendActorSync:
-		terminalPark := action.SuspendReason == lifecycle.SuspendReasonTerminal ||
-			lifecycle.IsTerminal(row.Task.GetStatus().GetState())
-		if row.ActorUID == "" && terminalPark {
-			return actionExecOutcome{
-				kind: outcomeCompleted,
-				input: &lifecycle.ActionCompletedInput{
-					ActionID: action.ID,
-					Kind:     action.Kind,
-				},
-			}
-		}
-		gen, err := r.runtime.SuspendActorSync(ctx, atespace, actorName)
-		if err != nil {
-			switch statusCode(err) {
-			case codes.FailedPrecondition:
-				return r.resolveSuspendPrecondition(parentCtx, ctx, key, row, action, terminalPark, err)
-			case codes.NotFound:
-				if terminalPark {
-					return actionExecOutcome{
-						kind: outcomeCompleted,
-						input: &lifecycle.ActionCompletedInput{
-							ActionID: action.ID,
-							Kind:     action.Kind,
-						},
-					}
-				}
-				if row.ActorUID != "" {
-					return actionExecOutcome{
-						kind:  outcomeObservedActor,
-						input: &lifecycle.ObservedActorInput{MissingConfirmed: true},
-					}
-				}
-			}
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID:    action.ID,
-				Kind:        action.Kind,
-				SnapshotGen: gen,
-			},
-		}
-
-	case lifecycle.ActionRevertActor:
-		gen, err := r.runtime.RevertActor(ctx, atespace, actorName)
-		if err != nil {
-			if statusCode(err) == codes.NotFound && row.ActorUID != "" {
-				return actionExecOutcome{
-					kind:  outcomeObservedActor,
-					input: &lifecycle.ObservedActorInput{MissingConfirmed: true},
-				}
-			}
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID:    action.ID,
-				Kind:        action.Kind,
-				SnapshotGen: gen,
-			},
-		}
-
-	case lifecycle.ActionDeleteActor:
-		if err := r.runtime.DeleteActor(ctx, atespace, actorName, row.ActorUID); err != nil {
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-			},
-		}
-
-	case lifecycle.ActionCreateTag:
-		if err := r.runtime.CreateSnapshotTag(ctx, atespace, actorName, action.Tag); err != nil {
-			if statusCode(err) == codes.NotFound && row.ActorUID != "" {
-				return actionExecOutcome{
-					kind:  outcomeObservedActor,
-					input: &lifecycle.ObservedActorInput{MissingConfirmed: true},
-				}
-			}
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-			},
-		}
-
-	case lifecycle.ActionDeleteTag:
-		if err := r.runtime.DeleteSnapshotTag(ctx, atespace, action.Tag); err != nil {
-			return r.classifyFailureOutcome(parentCtx, ctx, action, err)
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-			},
-		}
-
-	default:
+	executor, ok := r.executors[action.Kind]
+	if !ok {
 		return actionExecOutcome{
 			kind: outcomePermanentFailure,
 			input: &lifecycle.ActionFailedInput{
@@ -857,144 +627,20 @@ func (r *Reconciler) executeAction(parentCtx, ctx context.Context, key store.Tas
 			},
 		}
 	}
-}
-
-func (r *Reconciler) resolveResumePrecondition(parentCtx, ctx context.Context, key store.TaskKey, row *store.TaskRow, action lifecycle.Action, resumeErr error) actionExecOutcome {
-	actor, getErr := r.runtime.GetActor(ctx, key.Atespace, key.Name)
-	if getErr != nil {
-		if statusCode(getErr) == codes.NotFound && row.ActorUID != "" {
-			return actionExecOutcome{
-				kind:  outcomeObservedActor,
-				input: &lifecycle.ObservedActorInput{MissingConfirmed: true},
-			}
-		}
-		return r.classifyFailureOutcome(parentCtx, ctx, action, getErr)
-	}
-	switch actor.GetStatus().GetState() {
-	case ateapipb.ActorState_ACTOR_STATE_RUNNING:
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-			},
-		}
-	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
-		return actionExecOutcome{
-			kind: outcomeObservedActor,
-			input: &lifecycle.ObservedActorInput{
-				ActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
-				ActorUID:     actor.GetMetadata().GetUid(),
-				CrashMessage: actor.GetStatus().GetCrash().GetMessage(),
-			},
-		}
-	case ateapipb.ActorState_ACTOR_STATE_RESUMING,
-		ateapipb.ActorState_ACTOR_STATE_SUSPENDING,
-		ateapipb.ActorState_ACTOR_STATE_REVERTING:
-		return actionExecOutcome{kind: outcomeTransientRetry}
-	default:
-		return r.classifyFailureOutcome(parentCtx, ctx, action, resumeErr)
-	}
-}
-
-func (r *Reconciler) resolveSuspendPrecondition(parentCtx, ctx context.Context, key store.TaskKey, row *store.TaskRow, action lifecycle.Action, terminalPark bool, suspendErr error) actionExecOutcome {
-	actor, getErr := r.runtime.GetActor(ctx, key.Atespace, key.Name)
-	if getErr != nil {
-		if statusCode(getErr) == codes.NotFound {
-			if terminalPark {
-				return actionExecOutcome{
-					kind: outcomeCompleted,
-					input: &lifecycle.ActionCompletedInput{
-						ActionID: action.ID,
-						Kind:     action.Kind,
-					},
-				}
-			}
-			if row.ActorUID != "" {
-				return actionExecOutcome{
-					kind:  outcomeObservedActor,
-					input: &lifecycle.ObservedActorInput{MissingConfirmed: true},
-				}
-			}
-		}
-		return r.classifyFailureOutcome(parentCtx, ctx, action, getErr)
-	}
-	switch actor.GetStatus().GetState() {
-	case ateapipb.ActorState_ACTOR_STATE_SUSPENDED:
-		if substrate.HasPendingSnapshotUpload(actor) {
-			return actionExecOutcome{kind: outcomeTransientRetry}
-		}
-		return actionExecOutcome{
-			kind: outcomeCompleted,
-			input: &lifecycle.ActionCompletedInput{
-				ActionID:    action.ID,
-				Kind:        action.Kind,
-				SnapshotGen: substrate.LatestDurableSnapshotGeneration(actor),
-			},
-		}
-	case ateapipb.ActorState_ACTOR_STATE_CRASHED:
-		return actionExecOutcome{
-			kind: outcomeObservedActor,
-			input: &lifecycle.ObservedActorInput{
-				ActorState:   ateapipb.ActorState_ACTOR_STATE_CRASHED,
-				ActorUID:     actor.GetMetadata().GetUid(),
-				CrashMessage: actor.GetStatus().GetCrash().GetMessage(),
-			},
-		}
-	case ateapipb.ActorState_ACTOR_STATE_RESUMING,
-		ateapipb.ActorState_ACTOR_STATE_SUSPENDING,
-		ateapipb.ActorState_ACTOR_STATE_REVERTING:
-		return actionExecOutcome{kind: outcomeTransientRetry}
-	default:
-		return r.classifyFailureOutcome(parentCtx, ctx, action, suspendErr)
-	}
-}
-
-func (r *Reconciler) classifyFailureOutcome(parentCtx, callCtx context.Context, action lifecycle.Action, err error) actionExecOutcome {
-	if parentCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
-		statusCode(err) == codes.Canceled || statusCode(err) == codes.DeadlineExceeded) {
-		return actionExecOutcome{kind: outcomeCanceled}
-	}
-	switch classifySubstrateError(callCtx, action.Kind, err) {
-	case errorClassCanceled:
-		return actionExecOutcome{kind: outcomeCanceled}
-	case errorClassCapacityUnavailable:
-		return actionExecOutcome{
-			kind: outcomeCapacityUnavailable,
-			input: &lifecycle.CapacityUnavailableInput{
-				ActionID: action.ID,
-				Message:  substrateMessage(err),
-			},
-		}
-	case errorClassTransient:
-		return actionExecOutcome{kind: outcomeTransientRetry}
-	default:
-		return actionExecOutcome{
-			kind: outcomePermanentFailure,
-			input: &lifecycle.ActionFailedInput{
-				ActionID: action.ID,
-				Kind:     action.Kind,
-				Reason:   v1alpha1.TaskStatusReason_TASK_STATUS_REASON_PROVISIONING_FAILED,
-				Message:  substrateMessage(err),
-			},
-		}
-	}
+	return executor.Execute(ActionContext{
+		ParentCtx: parentCtx,
+		Ctx:       ctx,
+		Key:       key,
+		Row:       row,
+		Action:    action,
+		StoreNow:  storeNow,
+	})
 }
 
 func (r *Reconciler) releaseLeaseBestEffort(key store.TaskKey, leaseToken string, requeueAfter time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownReleaseTimeout)
 	defer cancel()
 	_ = r.queue.ReleaseLease(ctx, key, leaseToken, requeueAfter)
-}
-
-func (r *Reconciler) combinedEgressRules(taskRules []*ateapipb.EgressRule) []*ateapipb.EgressRule {
-	if len(r.extraRules) == 0 && len(taskRules) == 0 {
-		return nil
-	}
-	out := make([]*ateapipb.EgressRule, 0, len(r.extraRules)+len(taskRules))
-	out = append(out, r.extraRules...)
-	out = append(out, taskRules...)
-	return out
 }
 
 func (r *Reconciler) defaultResolveWorkspaceTag(ctx context.Context, atespace, _, _, requestedTag string) (string, bool, error) {
