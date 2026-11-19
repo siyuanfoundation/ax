@@ -1,0 +1,445 @@
+{
+  "name": "ax-vscode",
+  "displayName": "AX — Agent Sandbox Orchestrator",
+  "description": "Install the ax CLI and AX coding-agent skills in one click, author ax.io/v1alpha1 manifests with schema validation, and manage sandboxed Tasks, Workspaces, Gateways, and Models from VS Code.",
+  "version": "0.1.0",
+  "publisher": "google",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/google/ax.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Cloud",
+    "Other"
+  ],
+  "keywords": [
+    "ax",
+    "agent",
+    "sandbox",
+    "substrate",
+    "kubernetes",
+    "gvisor",
+    "skills",
+    "mcp"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "chatSkills": [
+      {
+        "path": "./skills/ax/SKILL.md"
+      }
+    ],
+    "languageModelTools": [
+      {
+        "name": "ax_status",
+        "displayName": "AX Environment & Context Status",
+        "modelDescription": "Inspect AX CLI version, local Kind + Agent Substrate + AX stack health (`ax local status -o json`), container runtime readiness, and active Kubernetes contexts/tunnels (`ax ctx`). Call this first before creating or managing AX tasks.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "axStatus",
+        "icon": "$(pulse)",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "localClusterName": {
+              "type": "string",
+              "description": "Optional local cluster name for `ax local status` (defaults to ax-local)."
+            }
+          }
+        }
+      },
+      {
+        "name": "ax_list_resources",
+        "displayName": "List AX Resources",
+        "modelDescription": "List AX `tasks`, `workspaces`, `gateways`, or `models` in the configured cluster context and atespace.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "axList",
+        "icon": "$(list-tree)",
+        "inputSchema": {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "tasks",
+                "workspaces",
+                "gateways",
+                "models"
+              ],
+              "description": "Resource collection to list."
+            },
+            "atespace": {
+              "type": "string",
+              "description": "Optional atespace override (defaults to configured `ax.atespace` or `default`)."
+            }
+          }
+        }
+      },
+      {
+        "name": "ax_manage_task",
+        "displayName": "Apply or Manage AX Resource",
+        "modelDescription": "Apply an `ax.io/v1alpha1` YAML manifest (`apply`), or `resume`, `suspend`, `describe`, or `delete` an AX resource (`task`, `workspace`, `gateway`, `model`). Remember: newly applied Tasks start `Suspended` and require `resume` to execute.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "axManage",
+        "icon": "$(rocket)",
+        "inputSchema": {
+          "type": "object",
+          "required": [
+            "action"
+          ],
+          "properties": {
+            "action": {
+              "type": "string",
+              "enum": [
+                "apply",
+                "resume",
+                "suspend",
+                "describe",
+                "delete"
+              ],
+              "description": "Lifecycle operation to perform."
+            },
+            "manifestYaml": {
+              "type": "string",
+              "description": "YAML manifest text to submit when `action` is `apply`."
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "task",
+                "workspace",
+                "gateway",
+                "model"
+              ],
+              "description": "Resource kind for `describe` or `delete` (defaults to `task` for `resume`/`suspend`)."
+            },
+            "name": {
+              "type": "string",
+              "description": "Resource name for `resume`, `suspend`, `describe`, or `delete`."
+            },
+            "atespace": {
+              "type": "string",
+              "description": "Optional atespace override."
+            }
+          }
+        }
+      },
+      {
+        "name": "ax_ssh_exec",
+        "displayName": "Execute Command in AX Task Sandbox",
+        "modelDescription": "Run a non-interactive command inside a `Working` AX Task sandbox (`ax ssh <task> -- sh -c <command>`). Requires `spec.debug: true` on the Task.",
+        "canBeReferencedInPrompt": true,
+        "toolReferenceName": "axExec",
+        "icon": "$(terminal)",
+        "inputSchema": {
+          "type": "object",
+          "required": [
+            "taskName",
+            "command"
+          ],
+          "properties": {
+            "taskName": {
+              "type": "string",
+              "description": "Name of the Working AX task."
+            },
+            "command": {
+              "type": "string",
+              "description": "Shell command executed via `sh -c` inside the task sandbox."
+            },
+            "atespace": {
+              "type": "string",
+              "description": "Optional atespace override."
+            }
+          }
+        }
+      }
+    ],
+    "yamlValidation": [
+      {
+        "fileMatch": [
+          "*.ax.yaml",
+          "*.ax.yml",
+          "ax-*.yaml",
+          "ax-*.yml"
+        ],
+        "url": "./schemas/ax-v1alpha1.schema.json"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "axSidebar",
+          "title": "AX",
+          "icon": "media/ax-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "axSidebar": [
+        {
+          "id": "axExplorer",
+          "name": "Sandboxes & Cluster"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ax.refresh",
+        "title": "AX: Refresh Explorer",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ax.installCliAndSkills",
+        "title": "AX: Install 'ax' CLI & Agent Skills",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "ax.localStart",
+        "title": "AX: Start Local Sandbox Cluster (ax local start)",
+        "icon": "$(play-circle)"
+      },
+      {
+        "command": "ax.localStop",
+        "title": "AX: Stop Local Sandbox Cluster (ax local stop)",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "ax.localStatus",
+        "title": "AX: Show Local Cluster & Host Status",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "ax.localDelete",
+        "title": "AX: Delete Local Sandbox Cluster",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "ax.switchContext",
+        "title": "AX: Switch Kubernetes Context (ax ctx)",
+        "icon": "$(server-environment)"
+      },
+      {
+        "command": "ax.applyFile",
+        "title": "AX: Apply Manifest File (ax apply -f)",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "ax.newTaskManifest",
+        "title": "AX: New Task & Workspace Manifest",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "ax.resumeTask",
+        "title": "AX: Resume Task",
+        "icon": "$(play)"
+      },
+      {
+        "command": "ax.suspendTask",
+        "title": "AX: Suspend Task",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "ax.sshTerminal",
+        "title": "AX: Open Sandbox SSH Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "ax.describeResource",
+        "title": "AX: Describe Resource",
+        "icon": "$(info)"
+      },
+      {
+        "command": "ax.getResourceYaml",
+        "title": "AX: View Live Resource YAML",
+        "icon": "$(code)"
+      },
+      {
+        "command": "ax.promoteTask",
+        "title": "AX: Promote Task to Cluster...",
+        "icon": "$(repo-push)"
+      },
+      {
+        "command": "ax.deleteResource",
+        "title": "AX: Delete Resource",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "ax.stopTunnel",
+        "title": "AX: Stop Background Tunnel",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "ax.openStudio",
+        "title": "AX: Launch AX Studio Web UI",
+        "icon": "$(globe)"
+      },
+      {
+        "command": "ax.showLogs",
+        "title": "AX: Show Output Logs",
+        "icon": "$(output)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "ax.newTaskManifest",
+          "when": "view == axExplorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ax.switchContext",
+          "when": "view == axExplorer",
+          "group": "navigation@2"
+        },
+        {
+          "command": "ax.refresh",
+          "when": "view == axExplorer",
+          "group": "navigation@3"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "ax.resumeTask",
+          "when": "view == axExplorer && viewItem == axTaskSuspended",
+          "group": "inline@1"
+        },
+        {
+          "command": "ax.suspendTask",
+          "when": "view == axExplorer && viewItem == axTaskWorking",
+          "group": "inline@1"
+        },
+        {
+          "command": "ax.sshTerminal",
+          "when": "view == axExplorer && viewItem == axTaskWorking",
+          "group": "inline@2"
+        },
+        {
+          "command": "ax.describeResource",
+          "when": "view == axExplorer && viewItem =~ /^ax(Task|Workspace|Gateway|Model)/",
+          "group": "1_inspect@1"
+        },
+        {
+          "command": "ax.getResourceYaml",
+          "when": "view == axExplorer && viewItem =~ /^ax(Task|Workspace|Gateway|Model)/",
+          "group": "1_inspect@2"
+        },
+        {
+          "command": "ax.promoteTask",
+          "when": "view == axExplorer && viewItem =~ /^axTask/",
+          "group": "2_lifecycle@1"
+        },
+        {
+          "command": "ax.deleteResource",
+          "when": "view == axExplorer && viewItem =~ /^ax(Task|Workspace|Gateway|Model)/",
+          "group": "9_danger@1"
+        },
+        {
+          "command": "ax.switchContext",
+          "when": "view == axExplorer && viewItem == axContext",
+          "group": "inline@1"
+        },
+        {
+          "command": "ax.stopTunnel",
+          "when": "view == axExplorer && viewItem == axTunnel",
+          "group": "inline@1"
+        },
+        {
+          "command": "ax.localStart",
+          "when": "view == axExplorer && viewItem == axLocalStopped",
+          "group": "inline@1"
+        },
+        {
+          "command": "ax.localStop",
+          "when": "view == axExplorer && viewItem == axLocalRunning",
+          "group": "inline@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "ax.applyFile",
+          "when": "resourceExtname == .yaml || resourceExtname == .yml",
+          "group": "ax@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "ax.applyFile",
+          "when": "resourceExtname == .yaml || resourceExtname == .yml",
+          "group": "ax@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AX",
+      "properties": {
+        "ax.autoInstallCliAndSkills": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically install the bundled `ax` CLI binary to `~/.ax/bin` (and add to VS Code terminal PATH) and sync the `ax` agent skill to `~/.agents/skills`, `~/.claude/skills`, and `~/.gemini/skills` on startup."
+        },
+        "ax.installDir": {
+          "type": "string",
+          "default": "",
+          "description": "Custom directory where the bundled `ax` binary is installed (defaults to `~/.ax/bin`)."
+        },
+        "ax.skillHomeDir": {
+          "type": "string",
+          "default": "",
+          "description": "Optional home directory override where `.agents/skills`, `.claude/skills`, and `.gemini/skills` are synced (defaults to user home `~`)."
+        },
+        "ax.atespace": {
+          "type": "string",
+          "default": "default",
+          "description": "Default AX atespace (`-a` / `--atespace`) for listing and managing resources."
+        },
+        "ax.namespace": {
+          "type": "string",
+          "default": "ax-system",
+          "description": "Kubernetes namespace where `ax-server` is deployed (`-n` / `--namespace`)."
+        },
+        "ax.context": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Kubernetes context override (`--context`). Empty uses the active kubeconfig current-context."
+        },
+        "ax.kubeconfig": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a custom kubeconfig file (`KUBECONFIG`) passed to `ax` commands."
+        },
+        "ax.server": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit `ax-server` address (`--server`), bypassing automatic Kubernetes tunneling."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:ax": "bash ./scripts/build-ax-bin.sh",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test:unit": "npm run compile && node ./dist/test/unit/runUnitTests.js",
+    "test:e2e": "npm run build:ax && npm run compile && node ./dist/test/e2e/runE2E.js",
+    "test": "npm run test:unit",
+    "package": "npm run build:ax && npm run compile && npx @vscode/vsce package --no-git-tag-version -o ax-vscode.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.3.2",
+    "typescript": "^5.6.3"
+  }
+}

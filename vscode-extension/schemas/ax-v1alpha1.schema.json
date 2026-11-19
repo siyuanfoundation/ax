@@ -1,0 +1,371 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ax.io/schemas/v1alpha1.json",
+  "title": "AX v1alpha1 Manifest",
+  "description": "Declarative specification for AX Task, Workspace, Gateway, and Model resources (ax.io/v1alpha1).",
+  "oneOf": [
+    { "$ref": "#/definitions/Task" },
+    { "$ref": "#/definitions/Workspace" },
+    { "$ref": "#/definitions/Gateway" },
+    { "$ref": "#/definitions/Model" }
+  ],
+  "definitions": {
+    "Rfc1123Label": {
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+      "description": "Lowercase RFC 1123 label (at most 63 lowercase alphanumeric characters or '-', starting and ending with an alphanumeric character)."
+    },
+    "ObjectMeta": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "$ref": "#/definitions/Rfc1123Label" },
+        "atespace": { "$ref": "#/definitions/Rfc1123Label" },
+        "labels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "Profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "string",
+          "pattern": "@sha256:[a-f0-9]{64}$",
+          "description": "Container image reference pinned by @sha256 digest (tag-only images are rejected by Agent Substrate)."
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "limits": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "cpu": {
+                  "type": "string",
+                  "description": "Kubernetes CPU quantity (e.g. '500m', '2')."
+                },
+                "memory": {
+                  "type": "string",
+                  "description": "Kubernetes memory quantity (e.g. '512Mi', '4Gi')."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Task": {
+      "type": "object",
+      "required": ["apiVersion", "kind", "metadata"],
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": { "const": "ax.io/v1alpha1" },
+        "kind": { "const": "Task" },
+        "metadata": { "$ref": "#/definitions/ObjectMeta" },
+        "spec": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "profile": { "$ref": "#/definitions/Profile" },
+            "commands": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "env": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": "string" },
+                  "value": { "type": "string" }
+                }
+              }
+            },
+            "workspace": {
+              "type": "object",
+              "required": ["name"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "$ref": "#/definitions/Rfc1123Label" },
+                "path": { "type": "string" }
+              }
+            },
+            "gateway": {
+              "type": "object",
+              "required": ["name"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "$ref": "#/definitions/Rfc1123Label" }
+              }
+            },
+            "goal": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "text": { "type": "string" }
+              }
+            },
+            "config": {
+              "type": "object",
+              "description": "Arbitrary YAML object (<= 16 KiB JSON) handed to the task runner."
+            },
+            "sessionId": { "type": "string" },
+            "debug": {
+              "type": "boolean",
+              "description": "Enable guest services inside the sandbox so `ax ssh` works."
+            }
+          }
+        }
+      }
+    },
+    "Workspace": {
+      "type": "object",
+      "required": ["apiVersion", "kind", "metadata"],
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": { "const": "ax.io/v1alpha1" },
+        "kind": { "const": "Workspace" },
+        "metadata": { "$ref": "#/definitions/ObjectMeta" },
+        "spec": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "setup": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "git": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["repo"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": { "type": "string" },
+                      "repo": { "type": "string" },
+                      "ref": { "type": "string" },
+                      "dir": { "type": "string" },
+                      "depth": { "type": "integer", "minimum": 0 }
+                    }
+                  }
+                },
+                "files": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["path", "content"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "path": { "type": "string" },
+                      "content": { "type": "string" }
+                    }
+                  }
+                },
+                "skills": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "path": { "type": "string" },
+                    "registries": {
+                      "type": "array",
+                      "items": { "$ref": "#/definitions/RegistryQuery" }
+                    }
+                  }
+                },
+                "commands": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                }
+              }
+            },
+            "mcp": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "registries": {
+                  "type": "array",
+                  "items": { "$ref": "#/definitions/RegistryQuery" }
+                },
+                "servers": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["name"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "name": { "type": "string" },
+                      "endpoint": { "type": "string" },
+                      "command": { "type": "string" },
+                      "args": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "RegistryQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string" },
+        "project": { "type": "string" },
+        "query": { "type": "string" }
+      }
+    },
+    "PortSet": {
+      "type": "object",
+      "oneOf": [
+        {
+          "required": ["numbers"],
+          "additionalProperties": false,
+          "properties": {
+            "numbers": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            }
+          }
+        },
+        {
+          "required": ["all"],
+          "additionalProperties": false,
+          "properties": {
+            "all": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "Gateway": {
+      "type": "object",
+      "required": ["apiVersion", "kind", "metadata"],
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": { "const": "ax.io/v1alpha1" },
+        "kind": { "const": "Gateway" },
+        "metadata": { "$ref": "#/definitions/ObjectMeta" },
+        "spec": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "egress": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "http": {
+                    "type": "object",
+                    "required": ["hostnames"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "hostnames": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                      },
+                      "ports": { "$ref": "#/definitions/PortSet" }
+                    }
+                  },
+                  "https": {
+                    "type": "object",
+                    "required": ["hostnames"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "hostnames": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                      },
+                      "ports": { "$ref": "#/definitions/PortSet" },
+                      "effects": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                          "replaceHeaders": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "required": ["header", "credentialUri"],
+                              "additionalProperties": false,
+                              "properties": {
+                                "header": { "type": "string" },
+                                "prefix": { "type": "string" },
+                                "credentialUri": { "type": "string" }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "tlsPassthrough": {
+                    "type": "object",
+                    "required": ["hostnames", "ports"],
+                    "additionalProperties": false,
+                    "properties": {
+                      "hostnames": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                      },
+                      "ports": { "$ref": "#/definitions/PortSet" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Model": {
+      "type": "object",
+      "required": ["apiVersion", "kind", "metadata"],
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": { "const": "ax.io/v1alpha1" },
+        "kind": { "const": "Model" },
+        "metadata": { "$ref": "#/definitions/ObjectMeta" },
+        "spec": {
+          "type": "object",
+          "required": ["provider", "model"],
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string",
+              "description": "Model provider (e.g. 'google', 'anthropic')."
+            },
+            "model": { "type": "string" },
+            "secretKey": {
+              "type": "object",
+              "required": ["name", "key"],
+              "additionalProperties": false,
+              "properties": {
+                "name": { "type": "string" },
+                "key": { "type": "string" }
+              }
+            },
+            "parameters": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "maxTokens": { "type": "integer", "minimum": 1 },
+                "temperature": { "type": "number" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -44,6 +44,7 @@ hack/                  E2E provisioning, Substrate manifest sync, and multi-arch
 hack/release/          Release scripts run by .github/workflows/release.yml on a vX.Y.Z tag (docs/releasing.md)
 docs/                  manifests.md is the user-facing API reference; local_installer.md walks through ax local / ax install / ax promote / ax studio
 skills/                Developer skills (SKILL.md format). .agents/skills, .claude/skills, and .gemini/skills symlink here.
+vscode-extension/      VS Code extension packaging the ax CLI binary, user-facing ax agent skill (chatSkills + .agents/.claude/.gemini sync), Language Model Tools, YAML schema, and Explorer UI
 ```
 
 ## Build / test (verified; this is what CI runs)
