@@ -58,6 +58,11 @@ export async function run(): Promise<void> {
   );
   const allCommands = await vscode.commands.getCommands(true);
   for (const cmd of [
+    'ax.guidedSetup',
+    'ax.prepareImages',
+    'ax.installOnCluster',
+    'ax.configureCredentialSecret',
+    'ax.viewTaskOutput',
     'ax.refresh',
     'ax.installCliAndSkills',
     'ax.applyFile',
@@ -76,7 +81,8 @@ export async function run(): Promise<void> {
 
   // 3. Verify live YAML editor diagnostics and manifest scaffolding command
   const scaffoldDoc = await vscode.commands.executeCommand<vscode.TextDocument>(
-    'ax.newTaskManifest'
+    'ax.newTaskManifest',
+    'starter'
   );
   assert.ok(scaffoldDoc, 'ax.newTaskManifest should open a starter YAML document');
   assert.ok(scaffoldDoc.getText().includes('apiVersion: ax.io/v1alpha1'));
@@ -85,6 +91,19 @@ export async function run(): Promise<void> {
     vscode.languages.getDiagnostics(scaffoldDoc.uri).length,
     0,
     'Starter manifest should have zero AX lint errors'
+  );
+
+  const prReviewDoc = await vscode.commands.executeCommand<vscode.TextDocument>(
+    'ax.newTaskManifest',
+    { template: 'pr-review', repo: 'etcd-io/etcd', prCount: 10 }
+  );
+  assert.ok(prReviewDoc, 'ax.newTaskManifest pr-review should open PR review pipeline YAML');
+  assert.ok(prReviewDoc.getText().includes('etcd-io/etcd'));
+  await sleep(150);
+  assert.strictEqual(
+    vscode.languages.getDiagnostics(prReviewDoc.uri).length,
+    0,
+    'PR review manifest template should have zero AX lint errors/warnings'
   );
 
   const badDoc = await vscode.workspace.openTextDocument({

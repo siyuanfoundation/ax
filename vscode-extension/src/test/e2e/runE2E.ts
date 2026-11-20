@@ -60,6 +60,7 @@ async function main(): Promise<void> {
     ...process.env,
     AX_INSTALL_DIR: installDir,
     AX_SKILL_HOME_DIR: fakeHome,
+    AX_SUPPRESS_STARTUP_PROMPT: '1',
     VSCODE_IPC_HOOK_CLI: undefined,
     ELECTRON_RUN_AS_NODE: undefined,
   };

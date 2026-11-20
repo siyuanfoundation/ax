@@ -138,6 +138,7 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "profile": { "$ref": "#/definitions/Profile" },
             "setup": {
               "type": "object",
               "additionalProperties": false,
@@ -183,6 +184,14 @@
                 "commands": {
                   "type": "array",
                   "items": { "type": "string" }
+                },
+                "gateway": {
+                  "type": "object",
+                  "required": ["name"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": { "$ref": "#/definitions/Rfc1123Label" }
+                  }
                 }
               }
             },

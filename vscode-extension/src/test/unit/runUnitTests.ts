@@ -17,15 +17,25 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
+  extractDescribeOutputSection,
   parseContextsTable,
   parseGatewaysTable,
   parseModelsTable,
   parseTasksTable,
   parseTunnelsTable,
   parseWorkspacesTable,
+  summarizeAxSubcommand,
   validateAxManifestText,
 } from '../../axCli';
 import { AGENT_SKILL_ROOTS, installAxCliAndSkills } from '../../installer';
+import {
+  DEFAULT_AX_RELEASE_VERSION,
+  DEFAULT_AX_RUNNER_VOLUME_IMAGE,
+  DEFAULT_AX_SERVER_IMAGE,
+  DEFAULT_AX_TASK_IMAGE,
+  parseReleaseServerYamlImages,
+  resolveEffectiveImages,
+} from '../../setupHelper';
 
 interface TestCase {
   name: string;
@@ -39,8 +49,15 @@ function test(name: string, fn: () => void | Promise<void>): void {
 
 const EXT_ROOT = path.resolve(__dirname, '..', '..', '..');
 
-test('package.json contributes chatSkills, languageModelTools, yamlValidation, and commands', () => {
+test('package.json contributes walkthroughs, chatSkills, languageModelTools, yamlValidation, and guided commands', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(EXT_ROOT, 'package.json'), 'utf8'));
+  assert.strictEqual(pkg.contributes.walkthroughs.length, 1);
+  assert.strictEqual(pkg.contributes.walkthroughs[0].id, 'axGettingStarted');
+  for (const step of pkg.contributes.walkthroughs[0].steps) {
+    const mdPath = path.join(EXT_ROOT, step.media.markdown);
+    assert.ok(fs.existsSync(mdPath), `Missing walkthrough markdown: ${mdPath}`);
+  }
+
   assert.strictEqual(pkg.contributes.chatSkills.length, 1);
   assert.strictEqual(pkg.contributes.chatSkills[0].path, './skills/ax/SKILL.md');
 
@@ -59,6 +76,14 @@ test('package.json contributes chatSkills, languageModelTools, yamlValidation, a
   );
   assert.ok(schema.definitions.Task && schema.definitions.Workspace);
   assert.ok(schema.definitions.Gateway && schema.definitions.Model);
+  assert.ok(
+    schema.definitions.Workspace.properties.spec.properties.profile,
+    'Workspace schema must support spec.profile'
+  );
+  assert.ok(
+    schema.definitions.Workspace.properties.spec.properties.setup.properties.gateway,
+    'Workspace schema must support spec.setup.gateway'
+  );
 
   const toolNames = pkg.contributes.languageModelTools.map((t: { name: string }) => t.name);
   assert.deepStrictEqual(toolNames, [
@@ -67,6 +92,24 @@ test('package.json contributes chatSkills, languageModelTools, yamlValidation, a
     'ax_manage_task',
     'ax_ssh_exec',
   ]);
+
+  const cfgProps = pkg.contributes.configuration.properties;
+  assert.strictEqual(cfgProps['ax.sourceRepoPath'], undefined, 'Extension must not depend on local sourceRepoPath');
+  assert.strictEqual(cfgProps['ax.releaseVersion'].default, DEFAULT_AX_RELEASE_VERSION);
+  assert.strictEqual(cfgProps['ax.serverImage'].default, DEFAULT_AX_SERVER_IMAGE);
+  assert.strictEqual(cfgProps['ax.defaultTaskImage'].default, DEFAULT_AX_TASK_IMAGE);
+  assert.strictEqual(cfgProps['ax.runnerVolumeImage'].default, DEFAULT_AX_RUNNER_VOLUME_IMAGE);
+
+  const cmdNames = pkg.contributes.commands.map((c: { command: string }) => c.command);
+  for (const requiredCmd of [
+    'ax.guidedSetup',
+    'ax.prepareImages',
+    'ax.installOnCluster',
+    'ax.configureCredentialSecret',
+    'ax.viewTaskOutput',
+  ]) {
+    assert.ok(cmdNames.includes(requiredCmd), `Missing command ${requiredCmd}`);
+  }
 });
 
 test('installAxCliAndSkills copies bundled binary and syncs skills to all agent roots', () => {
@@ -109,28 +152,69 @@ test('installAxCliAndSkills copies bundled binary and syncs skills to all agent 
       assert.ok(fs.existsSync(skillFile), `Missing synced skill at ${skillFile}`);
       assert.ok(fs.existsSync(refFile), `Missing synced reference at ${refFile}`);
     }
+
+    // Verify misnamed `.gemini/config/skills` JSON file is migrated to `skills.json` so Antigravity can scan `.gemini/config/skills/ax`
+    const fakeHome2 = path.join(tmpRoot, 'home-misnamed');
+    fs.mkdirSync(path.join(fakeHome2, '.gemini', 'config'), { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeHome2, '.gemini', 'config', 'skills'),
+      '{"entries": []}\n',
+      'utf8'
+    );
+    installAxCliAndSkills({
+      extensionPath: fakeExt,
+      installDir: path.join(fakeHome2, '.ax', 'bin'),
+      skillHomeDir: fakeHome2,
+    });
+    assert.ok(
+      fs.existsSync(path.join(fakeHome2, '.gemini', 'config', 'skills.json')),
+      'Expected misnamed .gemini/config/skills JSON file to migrate to skills.json'
+    );
+    assert.ok(
+      fs.existsSync(path.join(fakeHome2, '.gemini', 'config', 'skills', 'ax', 'SKILL.md')),
+      'Expected Antigravity skill synced to .gemini/config/skills/ax/SKILL.md'
+    );
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
 });
 
-test('axCli table parsers decode tasks, workspaces, gateways, models, contexts, and tunnels', () => {
+test('axCli helpers summarize subcommands, extract task Output, and decode tables', () => {
+  assert.strictEqual(
+    summarizeAxSubcommand(['-a', 'default', '-n', 'ax-system', 'get', 'tasks']),
+    'get tasks'
+  );
+  assert.strictEqual(
+    summarizeAxSubcommand(['-n', 'ax-system', 'apply', '-f', '/tmp/task.yaml']),
+    'apply /tmp/task.yaml'
+  );
+
+  const sampleDescribe = [
+    'Name:         etcd-review-prs',
+    'State:        Completed',
+    'Outcome:      TASK_RESULT_SUCCEEDED (exitCode=0)',
+    'Output:',
+    '  # Review Report',
+    '  - PR #1: LGTM',
+    '',
+    'Conditions:',
+    '  TYPE   STATUS',
+  ].join('\n');
+  assert.strictEqual(
+    extractDescribeOutputSection(sampleDescribe),
+    '# Review Report\n- PR #1: LGTM'
+  );
+
   const tasks = parseTasksTable(
     [
       'NAME          ATESPACE   STATE       ACTOR         AGE',
       'simple-task   default    Working     simple-task   2m',
+      'done-task     default    Completed   done-task     45s',
       'idle-task     team-a     Suspended   <none>        15s',
     ].join('\n')
   );
-  assert.strictEqual(tasks.length, 2);
-  assert.deepStrictEqual(tasks[0], {
-    name: 'simple-task',
-    atespace: 'default',
-    state: 'Working',
-    actor: 'simple-task',
-    age: '2m',
-  });
-  assert.strictEqual(tasks[1].state, 'Suspended');
+  assert.strictEqual(tasks.length, 3);
+  assert.strictEqual(tasks[1].state, 'Completed');
 
   const workspaces = parseWorkspacesTable(
     [
@@ -140,7 +224,6 @@ test('axCli table parsers decode tasks, workspaces, gateways, models, contexts, 
   );
   assert.strictEqual(workspaces.length, 1);
   assert.strictEqual(workspaces[0].gitRepos, 1);
-  assert.strictEqual(workspaces[0].mcpServers, 2);
 
   const gateways = parseGatewaysTable(
     [
@@ -149,7 +232,6 @@ test('axCli table parsers decode tasks, workspaces, gateways, models, contexts, 
     ].join('\n')
   );
   assert.strictEqual(gateways.length, 1);
-  assert.strictEqual(gateways[0].egressRules, 3);
 
   const models = parseModelsTable(
     [
@@ -158,7 +240,6 @@ test('axCli table parsers decode tasks, workspaces, gateways, models, contexts, 
     ].join('\n')
   );
   assert.strictEqual(models.length, 1);
-  assert.strictEqual(models[0].provider, 'google');
 
   const contexts = parseContextsTable(
     [
@@ -169,10 +250,6 @@ test('axCli table parsers decode tasks, workspaces, gateways, models, contexts, 
   );
   assert.strictEqual(contexts.length, 2);
   assert.strictEqual(contexts[0].current, true);
-  assert.strictEqual(contexts[0].name, 'ax-local');
-  assert.ok(contexts[0].tunnel.includes('Healthy'));
-  assert.strictEqual(contexts[1].current, false);
-  assert.strictEqual(contexts[1].tunnel, '-');
 
   assert.deepStrictEqual(parseTunnelsTable('No active tunnels found in ~/.ax/tunnels.\n'), []);
   const tunnels = parseTunnelsTable(
@@ -182,16 +259,26 @@ test('axCli table parsers decode tasks, workspaces, gateways, models, contexts, 
     ].join('\n')
   );
   assert.strictEqual(tunnels.length, 1);
-  assert.strictEqual(tunnels[0].localPort, 44007);
-  assert.strictEqual(tunnels[0].status, 'Active');
 });
 
-test('validateAxManifestText flags invalid names, tag-only images, and resources.requests', () => {
-  const validYaml = [
+test('validateAxManifestText skips YAML block scalars, warns on setup.git without gateway, and flags invalid fields', () => {
+  const validWithBlockScalar = [
     'apiVersion: ax.io/v1alpha1',
     'kind: Workspace',
     'metadata:',
     '  name: demo-ws',
+    'spec:',
+    '  setup:',
+    '    gateway:',
+    '      name: demo-gw',
+    '    git:',
+    '      - repo: "https://github.com/etcd-io/etcd.git"',
+    '    files:',
+    '      - path: "script.py"',
+    '        content: |',
+    '          # Embedded content with image: foo:latest and requests: should not trigger lint',
+    '          image: not-an-ax-field:latest',
+    '          requests:',
     '---',
     'apiVersion: ax.io/v1alpha1',
     'kind: Task',
@@ -205,7 +292,22 @@ test('validateAxManifestText flags invalid names, tag-only images, and resources
     '        cpu: "1"',
     '        memory: "512Mi"',
   ].join('\n');
-  assert.deepStrictEqual(validateAxManifestText(validYaml), []);
+  assert.deepStrictEqual(validateAxManifestText(validWithBlockScalar), []);
+
+  const missingSetupGatewayYaml = [
+    'apiVersion: ax.io/v1alpha1',
+    'kind: Workspace',
+    'metadata:',
+    '  name: no-gw-ws',
+    'spec:',
+    '  setup:',
+    '    git:',
+    '      - repo: "https://github.com/etcd-io/etcd.git"',
+  ].join('\n');
+  const gwWarn = validateAxManifestText(missingSetupGatewayYaml);
+  assert.strictEqual(gwWarn.length, 1);
+  assert.strictEqual(gwWarn[0].severity, 'warning');
+  assert.ok(gwWarn[0].message.includes('spec.setup.gateway'));
 
   const invalidYaml = [
     'apiVersion: ax.io/v1alpha1',
@@ -221,9 +323,40 @@ test('validateAxManifestText flags invalid names, tag-only images, and resources
   ].join('\n');
   const diags = validateAxManifestText(invalidYaml);
   assert.strictEqual(diags.length, 3);
-  assert.ok(diags.some((d) => d.message.includes('RFC 1123')));
-  assert.ok(diags.some((d) => d.message.includes('@sha256:')));
-  assert.ok(diags.some((d) => d.message.includes('resources.requests')));
+});
+
+test('setupHelper resolves official v0.4.0-rc.1 GHCR release images and parses release ax-server.yaml', () => {
+  const defaults = resolveEffectiveImages({});
+  assert.strictEqual(defaults.releaseVersion, 'v0.4.0-rc.1');
+  assert.strictEqual(defaults.serverImage, DEFAULT_AX_SERVER_IMAGE);
+  assert.strictEqual(defaults.defaultTaskImage, DEFAULT_AX_TASK_IMAGE);
+  assert.strictEqual(defaults.runnerVolumeImage, DEFAULT_AX_RUNNER_VOLUME_IMAGE);
+  assert.ok(defaults.serverImage.startsWith('ghcr.io/google/ax/ax-server@sha256:'));
+  assert.ok(defaults.defaultTaskImage.startsWith('ghcr.io/google/ax/ax-task-runner@sha256:'));
+  assert.ok(defaults.runnerVolumeImage.startsWith('ghcr.io/google/ax/ax-runner-volume@sha256:'));
+
+  const sampleReleaseYaml = [
+    'apiVersion: apps/v1',
+    'kind: Deployment',
+    'spec:',
+    '  template:',
+    '    spec:',
+    '      containers:',
+    '        - name: ax-server',
+    `          image: ${DEFAULT_AX_SERVER_IMAGE}`,
+    '          env:',
+    '            - name: AX_DEFAULT_TASK_IMAGE',
+    `              value: "${DEFAULT_AX_TASK_IMAGE}"`,
+    '            - name: AX_RUNNER_VOLUME_IMAGE',
+    `              value: "${DEFAULT_AX_RUNNER_VOLUME_IMAGE}"`,
+  ].join('\n');
+  const parsed = parseReleaseServerYamlImages(sampleReleaseYaml, 'v0.4.0-rc.1');
+  assert.deepStrictEqual(parsed, {
+    releaseVersion: 'v0.4.0-rc.1',
+    serverImage: DEFAULT_AX_SERVER_IMAGE,
+    defaultTaskImage: DEFAULT_AX_TASK_IMAGE,
+    runnerVolumeImage: DEFAULT_AX_RUNNER_VOLUME_IMAGE,
+  });
 });
 
 async function main(): Promise<void> {

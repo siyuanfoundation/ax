@@ -18,15 +18,15 @@ import {
   AxResourceKind,
   ContextEntry,
   GatewaySummary,
-  LocalStatusReport,
   ModelSummary,
   TaskSummary,
   TunnelEntry,
   WorkspaceSummary,
 } from './axCli';
+import { EnvironmentReadiness, ReadinessStep } from './setupHelper';
 
 export type AxTreeGroup =
-  | 'local'
+  | 'setup'
   | 'contexts'
   | 'tunnels'
   | 'tasks'
@@ -72,14 +72,21 @@ export class AxTreeItem extends vscode.TreeItem {
 export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
   private readonly _onDidChangeTreeData = new vscode.EventEmitter<AxTreeItem | undefined | void>();
   public readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+  private lastReadiness: EnvironmentReadiness | null = null;
 
   constructor(
     private readonly cli: AxCli,
-    private readonly getDefaultAtespace: () => string
+    private readonly getDefaultAtespace: () => string,
+    private readonly getReadiness: () => Promise<EnvironmentReadiness>
   ) {}
 
   public refresh(): void {
+    this.lastReadiness = null;
     this._onDidChangeTreeData.fire();
+  }
+
+  public getCachedReadiness(): EnvironmentReadiness | null {
+    return this.lastReadiness;
   }
 
   public getTreeItem(element: AxTreeItem): vscode.TreeItem {
@@ -91,16 +98,10 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
       const atespace = this.getDefaultAtespace();
       return [
         new AxTreeItem({
-          label: 'Local Sandbox Stack',
+          label: 'Setup & Cluster Readiness',
           collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
-          icon: new vscode.ThemeIcon('vm'),
-          group: 'local',
-        }),
-        new AxTreeItem({
-          label: 'Kubernetes Contexts',
-          collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
-          icon: new vscode.ThemeIcon('server-environment'),
-          group: 'contexts',
+          icon: new vscode.ThemeIcon('checklist'),
+          group: 'setup',
         }),
         new AxTreeItem({
           label: `Tasks (${atespace})`,
@@ -110,7 +111,7 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
         }),
         new AxTreeItem({
           label: `Workspaces (${atespace})`,
-          collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
+          collapsibleState: vscode.TreeItemCollapsibleState.Expanded,
           icon: new vscode.ThemeIcon('folder-library'),
           group: 'workspaces',
         }),
@@ -127,6 +128,12 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
           group: 'models',
         }),
         new AxTreeItem({
+          label: 'Kubernetes Contexts',
+          collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
+          icon: new vscode.ThemeIcon('server-environment'),
+          group: 'contexts',
+        }),
+        new AxTreeItem({
           label: 'Background Tunnels',
           collapsibleState: vscode.TreeItemCollapsibleState.Collapsed,
           icon: new vscode.ThemeIcon('plug'),
@@ -136,8 +143,8 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
     }
 
     switch (element.group) {
-      case 'local':
-        return this.getLocalChildren();
+      case 'setup':
+        return this.getSetupChildren();
       case 'contexts':
         return this.getContextChildren();
       case 'tunnels':
@@ -155,66 +162,125 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
     }
   }
 
-  private infoItem(label: string, description?: string, iconName: string = 'info'): AxTreeItem {
+  private infoItem(
+    label: string,
+    description?: string,
+    iconName: string = 'info',
+    command?: vscode.Command
+  ): AxTreeItem {
     return new AxTreeItem({
       label,
       description,
       icon: new vscode.ThemeIcon(iconName),
+      command,
     });
   }
 
-  private async getLocalChildren(): Promise<AxTreeItem[]> {
-    try {
-      const st: LocalStatusReport = await this.cli.localStatus();
-      const isRunning = st.state === 'Running';
-      const memGiB = st.host.memTotalBytes
-        ? `${(st.host.memTotalBytes / (1024 ** 3)).toFixed(1)} GiB`
-        : 'N/A';
+  private stepIcon(step: ReadinessStep): vscode.ThemeIcon {
+    switch (step.state) {
+      case 'ready':
+        return new vscode.ThemeIcon('pass-filled', new vscode.ThemeColor('testing.iconPassed'));
+      case 'warning':
+        return new vscode.ThemeIcon('warning', new vscode.ThemeColor('editorWarning.foreground'));
+      case 'optional':
+        return new vscode.ThemeIcon('key');
+      case 'missing':
+      default:
+        return new vscode.ThemeIcon('circle-large-outline', new vscode.ThemeColor('editorWarning.foreground'));
+    }
+  }
 
-      const md = new vscode.MarkdownString();
-      md.appendMarkdown(`### Local AX Stack (\`${st.name}\`)\n\n`);
-      md.appendMarkdown(`- **State**: \`${st.state}\`\n`);
-      md.appendMarkdown(`- **Substrate**: \`${st.substrateStatus}\`\n`);
-      md.appendMarkdown(`- **AX Server**: \`${st.axStatus}\`\n`);
-      md.appendMarkdown(
-        `- **Host Runtime**: \`${st.host.runtime || 'none'}\` (kernel \`${st.host.kernelVersion || 'N/A'}\`, RAM \`${memGiB}\`)\n`
-      );
-      if (st.host.error) {
-        md.appendMarkdown(`- **Host Preflight Error**: ${st.host.error}\n`);
+  private async getSetupChildren(): Promise<AxTreeItem[]> {
+    try {
+      const readiness = await this.getReadiness();
+      this.lastReadiness = readiness;
+
+      const items: AxTreeItem[] = [];
+      if (!readiness.allCoreReady) {
+        items.push(
+          new AxTreeItem({
+            label: 'Launch Guided Setup Wizard...',
+            description: 'Install missing AX & Substrate components',
+            icon: new vscode.ThemeIcon('sparkle', new vscode.ThemeColor('textLink.foreground')),
+            contextValue: 'axGuidedSetupCTA',
+            command: {
+              command: 'ax.guidedSetup',
+              title: 'Run Guided Setup',
+            },
+          })
+        );
       }
 
-      const items: AxTreeItem[] = [
-        new AxTreeItem({
-          label: `Cluster: ${st.name}`,
-          description: st.state,
-          tooltip: md,
-          contextValue: isRunning ? 'axLocalRunning' : 'axLocalStopped',
-          icon: new vscode.ThemeIcon(
-            isRunning ? 'pass-filled' : 'circle-outline',
-            isRunning ? new vscode.ThemeColor('testing.iconPassed') : undefined
-          ),
-          command: {
-            command: 'ax.localStatus',
-            title: 'Show Local Status',
-          },
-        }),
-      ];
+      for (const step of readiness.steps) {
+        const md = new vscode.MarkdownString('', true);
+        md.isTrusted = true;
+        md.appendMarkdown(`### ${step.title}\n\n`);
+        md.appendMarkdown(`**Status**: ${step.summary}\n\n`);
+        md.appendMarkdown(`${step.detail}\n`);
+        if (step.actionCommand && step.actionLabel) {
+          md.appendMarkdown(`\n[$(play) ${step.actionLabel}](command:${step.actionCommand})`);
+        }
 
-      if (st.host.error) {
-        items.push(this.infoItem('Host Check', st.host.error, 'warning'));
-      } else if (st.host.runtime) {
+        let contextValue = `axStep_${step.id}_${step.state}`;
+        if (step.id === 'substrate') {
+          contextValue =
+            readiness.localStatus?.state === 'Running' ? 'axLocalRunning' : 'axLocalStopped';
+        }
+
         items.push(
-          this.infoItem(
-            `Runtime: ${st.host.runtime}`,
-            `Linux ${st.host.kernelVersion} · ${memGiB}`,
-            'server-process'
-          )
+          new AxTreeItem({
+            label: step.title,
+            description: step.summary,
+            tooltip: md,
+            contextValue,
+            icon: this.stepIcon(step),
+            command: step.actionCommand
+              ? {
+                  command: step.actionCommand,
+                  title: step.actionLabel || step.title,
+                }
+              : undefined,
+          })
         );
       }
       return items;
     } catch (err) {
-      return [this.infoItem('Unable to query local status', (err as Error).message, 'warning')];
+      return [
+        this.infoItem(
+          'Unable to inspect setup readiness',
+          (err as Error).message,
+          'warning',
+          { command: 'ax.guidedSetup', title: 'Run Guided Setup' }
+        ),
+      ];
     }
+  }
+
+  private async isClusterProbablyReady(): Promise<boolean> {
+    const r = this.lastReadiness ?? (await this.getReadiness().catch(() => null));
+    if (!r) {
+      return false;
+    }
+    this.lastReadiness = r;
+    if (r.allCoreReady) {
+      return true;
+    }
+    if (!r.activeContext || r.activeContext === 'no-context') {
+      return false;
+    }
+    if (r.activeContext === 'ax-local' && r.localStatus?.state !== 'Running') {
+      return false;
+    }
+    return true;
+  }
+
+  private unreadyClusterItem(): AxTreeItem {
+    return this.infoItem(
+      'AX cluster not set up yet',
+      'Click to run Guided Setup',
+      'tools',
+      { command: 'ax.guidedSetup', title: 'Run Guided Setup' }
+    );
   }
 
   private async getContextChildren(): Promise<AxTreeItem[]> {
@@ -269,29 +335,45 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
   }
 
   private async getTaskChildren(): Promise<AxTreeItem[]> {
+    if (!(await this.isClusterProbablyReady())) {
+      return [this.unreadyClusterItem()];
+    }
     try {
       const tasks: TaskSummary[] = await this.cli.listTasks();
       if (tasks.length === 0) {
-        return [this.infoItem('No tasks in atespace')];
+        return [
+          this.infoItem('No tasks in atespace', 'Click + to create manifest', 'add', {
+            command: 'ax.newTaskManifest',
+            title: 'New Task & Workspace Manifest',
+          }),
+        ];
       }
       return tasks.map((t) => {
         const lower = t.state.toLowerCase();
         const isWorking = lower === 'working';
+        const isCompleted = lower === 'completed';
         const isSuspended = lower === 'suspended';
         const isFailed = lower.includes('fail') || lower.includes('error');
 
         let contextValue = 'axTaskOther';
-        let icon = new vscode.ThemeIcon('Loading~spin');
+        let icon = new vscode.ThemeIcon('loading~spin');
         if (isWorking) {
           contextValue = 'axTaskWorking';
           icon = new vscode.ThemeIcon(
             'play-circle',
             new vscode.ThemeColor('testing.iconPassed')
           );
+        } else if (isCompleted) {
+          contextValue = 'axTaskCompleted';
+          icon = new vscode.ThemeIcon(
+            'pass-filled',
+            new vscode.ThemeColor('testing.iconPassed')
+          );
         } else if (isSuspended) {
           contextValue = 'axTaskSuspended';
           icon = new vscode.ThemeIcon('debug-pause');
         } else if (isFailed) {
+          contextValue = 'axTaskFailed';
           icon = new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
         }
 
@@ -306,30 +388,42 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
           atespace: t.atespace,
         });
         item.command = {
-          command: 'ax.describeResource',
-          title: 'Describe Task',
+          command: isCompleted ? 'ax.viewTaskOutput' : 'ax.describeResource',
+          title: isCompleted ? 'View Task Output' : 'Describe Task',
           arguments: [item],
         };
         return item;
       });
     } catch (err) {
-      return [this.infoItem('Cluster unreachable', (err as Error).message, 'warning')];
+      return [
+        this.infoItem('Cluster unreachable', (err as Error).message, 'warning', {
+          command: 'ax.guidedSetup',
+          title: 'Run Guided Setup',
+        }),
+      ];
     }
   }
 
   private async getWorkspaceChildren(): Promise<AxTreeItem[]> {
+    if (!(await this.isClusterProbablyReady())) {
+      return [this.unreadyClusterItem()];
+    }
     try {
       const workspaces: WorkspaceSummary[] = await this.cli.listWorkspaces();
       if (workspaces.length === 0) {
         return [this.infoItem('No workspaces in atespace')];
       }
       return workspaces.map((ws) => {
+        const ready = ws.phase.toLowerCase() === 'ready';
         const item = new AxTreeItem({
           label: ws.name,
           description: `${ws.phase} · ${ws.gitRepos} git · ${ws.mcpServers} mcp`,
           tooltip: `Workspace: ${ws.atespace}/${ws.name}\nPhase: ${ws.phase}`,
           contextValue: 'axWorkspace',
-          icon: new vscode.ThemeIcon('folder-library'),
+          icon: new vscode.ThemeIcon(
+            'folder-library',
+            ready ? new vscode.ThemeColor('testing.iconPassed') : undefined
+          ),
           resourceKind: 'workspace',
           resourceName: ws.name,
           atespace: ws.atespace,
@@ -347,6 +441,9 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
   }
 
   private async getGatewayChildren(): Promise<AxTreeItem[]> {
+    if (!(await this.isClusterProbablyReady())) {
+      return [this.unreadyClusterItem()];
+    }
     try {
       const gateways: GatewaySummary[] = await this.cli.listGateways();
       if (gateways.length === 0) {
@@ -376,6 +473,9 @@ export class AxExplorerProvider implements vscode.TreeDataProvider<AxTreeItem> {
   }
 
   private async getModelChildren(): Promise<AxTreeItem[]> {
+    if (!(await this.isClusterProbablyReady())) {
+      return [this.unreadyClusterItem()];
+    }
     try {
       const models: ModelSummary[] = await this.cli.listModels();
       if (models.length === 0) {

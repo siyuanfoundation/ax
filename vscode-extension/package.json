@@ -1,7 +1,7 @@
 {
   "name": "ax-vscode",
   "displayName": "AX — Agent Sandbox Orchestrator",
-  "description": "Install the ax CLI and AX coding-agent skills in one click, author ax.io/v1alpha1 manifests with schema validation, and manage sandboxed Tasks, Workspaces, Gateways, and Models from VS Code.",
+  "description": "Guided zero-to-sandbox setup for Agent Substrate & AX, one-click CLI + agent skill installation, ax.io/v1alpha1 schema diagnostics, and sandboxed Task, Workspace, Gateway, and Model management.",
   "version": "0.1.0",
   "publisher": "google",
   "license": "Apache-2.0",
@@ -33,6 +33,47 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "walkthroughs": [
+      {
+        "id": "axGettingStarted",
+        "title": "Set Up AX & Agent Substrate",
+        "description": "Go from a clean machine with zero AX tooling to running isolated gVisor agent sandboxes in 4 guided steps.",
+        "steps": [
+          {
+            "id": "axStepCli",
+            "title": "1. Install ax CLI & Agent Skills",
+            "description": "Install ~/.ax/bin/ax into VS Code's terminal PATH and sync the AX coding-agent skill to ~/.agents, ~/.claude, and ~/.gemini.\n[Install / Verify CLI & Skills](command:ax.installCliAndSkills)",
+            "media": {
+              "markdown": "media/walkthrough/step1-cli.md"
+            }
+          },
+          {
+            "id": "axStepImages",
+            "title": "2. Official AX Release Images (Pre-Configured)",
+            "description": "Pre-configured to pull official @sha256-pinned v0.4.0-rc.1 images from ghcr.io/google/ax with zero local build.\n[Switch Release or Custom Images](command:ax.prepareImages)",
+            "media": {
+              "markdown": "media/walkthrough/step2-images.md"
+            }
+          },
+          {
+            "id": "axStepCluster",
+            "title": "3. Bootstrap Agent Substrate & Deploy AX",
+            "description": "Provision the local Kubernetes 1.36+ Kind cluster, install Agent Substrate v1.0.0 + gVisor WorkerPool, and deploy ax-postgres + ax-server.\n[Bootstrap Local Stack](command:ax.localStart)",
+            "media": {
+              "markdown": "media/walkthrough/step3-cluster.md"
+            }
+          },
+          {
+            "id": "axStepCredentialsAndTask",
+            "title": "4. Add Egress Credential Secret & Run a Task",
+            "description": "Store your LLM API key as a labeled Kubernetes Secret for zero-trust Gateway injection, then scaffold and run a sandboxed Task.\n[Configure Credential Secret](command:ax.configureCredentialSecret)\n[New Task / PR Review Manifest](command:ax.newTaskManifest)",
+            "media": {
+              "markdown": "media/walkthrough/step4-credentials-and-run.md"
+            }
+          }
+        ]
+      }
+    ],
     "chatSkills": [
       {
         "path": "./skills/ax/SKILL.md"
@@ -42,7 +83,7 @@
       {
         "name": "ax_status",
         "displayName": "AX Environment & Context Status",
-        "modelDescription": "Inspect AX CLI version, local Kind + Agent Substrate + AX stack health (`ax local status -o json`), container runtime readiness, and active Kubernetes contexts/tunnels (`ax ctx`). Call this first before creating or managing AX tasks.",
+        "modelDescription": "Inspect AX CLI version, full 6-step setup readiness, local Kind + Agent Substrate + AX stack health (`ax local status -o json`), container runtime readiness, and active Kubernetes contexts/tunnels (`ax ctx`). Call this first before creating or managing AX tasks.",
         "canBeReferencedInPrompt": true,
         "toolReferenceName": "axStatus",
         "icon": "$(pulse)",
@@ -138,7 +179,7 @@
       {
         "name": "ax_ssh_exec",
         "displayName": "Execute Command in AX Task Sandbox",
-        "modelDescription": "Run a non-interactive command inside a `Working` AX Task sandbox (`ax ssh <task> -- sh -c <command>`). Requires `spec.debug: true` on the Task.",
+        "modelDescription": "Run a non-interactive command inside a `Working` or `Completed` AX Task sandbox (`ax ssh <task> -- sh -c <command>`). Requires `spec.debug: true` on the Task.",
         "canBeReferencedInPrompt": true,
         "toolReferenceName": "axExec",
         "icon": "$(terminal)",
@@ -194,6 +235,31 @@
       ]
     },
     "commands": [
+      {
+        "command": "ax.guidedSetup",
+        "title": "AX: Guided Setup Wizard (Install Missing Components)",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "ax.prepareImages",
+        "title": "AX: Select Release Version or Custom Container Images",
+        "icon": "$(package)"
+      },
+      {
+        "command": "ax.installOnCluster",
+        "title": "AX: Install AX on Current Kubernetes Cluster (ax install)",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "ax.configureCredentialSecret",
+        "title": "AX: Configure Egress Credential Secret (API Key)",
+        "icon": "$(key)"
+      },
+      {
+        "command": "ax.viewTaskOutput",
+        "title": "AX: View Task Output / Report",
+        "icon": "$(open-preview)"
+      },
       {
         "command": "ax.refresh",
         "title": "AX: Refresh Explorer",
@@ -293,6 +359,11 @@
     "menus": {
       "view/title": [
         {
+          "command": "ax.guidedSetup",
+          "when": "view == axExplorer",
+          "group": "navigation@0"
+        },
+        {
           "command": "ax.newTaskManifest",
           "when": "view == axExplorer",
           "group": "navigation@1"
@@ -315,14 +386,29 @@
           "group": "inline@1"
         },
         {
+          "command": "ax.viewTaskOutput",
+          "when": "view == axExplorer && (viewItem == axTaskCompleted || viewItem == axTaskWorking)",
+          "group": "inline@1"
+        },
+        {
+          "command": "ax.describeResource",
+          "when": "view == axExplorer && viewItem == axTaskCompleted",
+          "group": "inline@2"
+        },
+        {
           "command": "ax.suspendTask",
           "when": "view == axExplorer && viewItem == axTaskWorking",
-          "group": "inline@1"
+          "group": "inline@2"
         },
         {
           "command": "ax.sshTerminal",
           "when": "view == axExplorer && viewItem == axTaskWorking",
-          "group": "inline@2"
+          "group": "inline@3"
+        },
+        {
+          "command": "ax.viewTaskOutput",
+          "when": "view == axExplorer && viewItem =~ /^axTask/",
+          "group": "1_inspect@0"
         },
         {
           "command": "ax.describeResource",
@@ -365,6 +451,13 @@
           "group": "inline@1"
         }
       ],
+      "editor/title": [
+        {
+          "command": "ax.applyFile",
+          "when": "resourceFilename =~ /\\.ax\\.ya?ml$/ || resourceFilename =~ /^ax-.*\\.ya?ml$/",
+          "group": "navigation@1"
+        }
+      ],
       "editor/context": [
         {
           "command": "ax.applyFile",
@@ -386,7 +479,12 @@
         "ax.autoInstallCliAndSkills": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically install the bundled `ax` CLI binary to `~/.ax/bin` (and add to VS Code terminal PATH) and sync the `ax` agent skill to `~/.agents/skills`, `~/.claude/skills`, and `~/.gemini/skills` on startup."
+          "description": "Automatically install the bundled `ax` CLI binary to `~/.ax/bin` (and add to VS Code terminal PATH) and sync the `ax` agent skill to `~/.agents/skills`, `~/.claude/skills`, `~/.gemini/skills`, and `~/.gemini/config/skills` (Antigravity) on startup."
+        },
+        "ax.promptGuidedSetupOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prompt to launch the AX Guided Setup Wizard on startup when Agent Substrate or AX Control Plane is not yet installed."
         },
         "ax.installDir": {
           "type": "string",
@@ -397,6 +495,40 @@
           "type": "string",
           "default": "",
           "description": "Optional home directory override where `.agents/skills`, `.claude/skills`, and `.gemini/skills` are synced (defaults to user home `~`)."
+        },
+        "ax.releaseVersion": {
+          "type": "string",
+          "default": "v0.4.0-rc.1",
+          "description": "Official `google/ax` GitHub release tag used for AX container image defaults."
+        },
+        "ax.serverImage": {
+          "type": "string",
+          "default": "ghcr.io/google/ax/ax-server@sha256:95737151ccc54fdb8d99a8a8674f11777d7b08b7108a7b80820a1c502bb71223",
+          "description": "Container image reference (`repo:tag` or `repo@sha256:...`) passed as `--server-image` to `ax local start` and `ax install` (defaults to official `v0.4.0-rc.1` GHCR release)."
+        },
+        "ax.defaultTaskImage": {
+          "type": "string",
+          "default": "ghcr.io/google/ax/ax-task-runner@sha256:3a61e70d70cede25cec04c34b2902e2febac08bd78741207101d5c102f6e7a2c",
+          "description": "Default sandbox task container image (`--default-task-image`) used when a Task omits `spec.profile.image` (defaults to official `v0.4.0-rc.1` GHCR release)."
+        },
+        "ax.runnerVolumeImage": {
+          "type": "string",
+          "default": "ghcr.io/google/ax/ax-runner-volume@sha256:ac849f8357ac5b412d2d35d9076ef94b00557399d95c52c62353954e2101be07",
+          "description": "Optional runner volume container image (`--runner-volume-image`) mounted read-only into task containers (defaults to official `v0.4.0-rc.1` GHCR release)."
+        },
+        "ax.localWorkers": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 16,
+          "description": "Number of gVisor worker replicas (`--workers`) deployed by `ax local start`."
+        },
+        "ax.autoRefreshIntervalSeconds": {
+          "type": "integer",
+          "default": 4,
+          "minimum": 0,
+          "maximum": 60,
+          "description": "Live auto-refresh interval (in seconds) while the AX Explorer sidebar is visible so tasks created by CLI coding agents appear automatically (`0` disables polling)."
         },
         "ax.atespace": {
           "type": "string",

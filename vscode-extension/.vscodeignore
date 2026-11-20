@@ -9,3 +9,5 @@ dist/test/**
 .gitignore
 tsconfig.json
 package-lock.json
+demo/**
+USER_GUIDE.md

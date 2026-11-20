@@ -14,6 +14,7 @@
 
 import * as vscode from 'vscode';
 import { AxCli, AxResourceKind } from './axCli';
+import { EnvironmentReadiness } from './setupHelper';
 
 export interface AxStatusToolInput {
   localClusterName?: string;
@@ -45,15 +46,20 @@ export interface AxToolHandlers {
   sshExec(input: AxSshExecToolInput): Promise<string>;
 }
 
-export function createAxToolHandlers(cli: AxCli, onChanged?: () => void): AxToolHandlers {
+export function createAxToolHandlers(
+  cli: AxCli,
+  onChanged?: () => void,
+  getReadiness?: () => Promise<EnvironmentReadiness>
+): AxToolHandlers {
   return {
     async status(input: AxStatusToolInput): Promise<string> {
-      const [ver, local, contexts] = await Promise.all([
+      const [ver, local, contexts, readiness] = await Promise.all([
         cli.version().catch((e) => `unavailable (${(e as Error).message})`),
         cli.localStatus(input.localClusterName).catch((e) => ({
           error: (e as Error).message,
         })),
         cli.listContexts().catch(() => []),
+        getReadiness ? getReadiness().catch(() => null) : Promise.resolve(null),
       ]);
       const activeContext = contexts.find((c) => c.current)?.name ?? null;
       return JSON.stringify(
@@ -62,6 +68,15 @@ export function createAxToolHandlers(cli: AxCli, onChanged?: () => void): AxTool
           activeContext,
           contexts,
           localStack: local,
+          setupReadiness: readiness
+            ? {
+                allCoreReady: readiness.allCoreReady,
+                credentialSecrets: readiness.credentialSecrets,
+                missingSteps: readiness.steps
+                  .filter((s) => s.state === 'missing')
+                  .map((s) => ({ id: s.id, title: s.title, summary: s.summary, command: s.actionCommand })),
+              }
+            : undefined,
         },
         null,
         2

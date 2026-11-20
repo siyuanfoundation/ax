@@ -90,6 +90,9 @@ export interface AxCliConfig {
   context?: string;
   kubeconfig?: string;
   server?: string;
+  serverImage?: string;
+  defaultTaskImage?: string;
+  runnerVolumeImage?: string;
   timeoutMs?: number;
 }
 
@@ -107,6 +110,26 @@ export interface ManifestDiagnostic {
 
 const RFC1123_LABEL_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 const SUPPORTED_KINDS = new Set(['Task', 'Workspace', 'Gateway', 'Model']);
+const GLOBAL_VALUE_FLAGS = new Set(['-a', '--atespace', '-n', '--namespace', '--context', '--server']);
+
+export function summarizeAxSubcommand(args: string[]): string {
+  const tokens: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const tok = args[i];
+    if (GLOBAL_VALUE_FLAGS.has(tok)) {
+      i++; // skip value argument
+      continue;
+    }
+    if (tok.startsWith('-')) {
+      continue;
+    }
+    tokens.push(tok);
+    if (tokens.length >= 2) {
+      break;
+    }
+  }
+  return tokens.join(' ') || args[0] || '';
+}
 
 export function splitTableRow(line: string): string[] {
   return line
@@ -248,8 +271,33 @@ export function parseTunnelsTable(output: string): TunnelEntry[] {
 }
 
 /**
+ * Extracts `Output:` block from `ax describe task <name>` output when present.
+ */
+export function extractDescribeOutputSection(describeText: string): string | null {
+  const lines = describeText.split(/\r?\n/);
+  const outIdx = lines.findIndex((l) => l === 'Output:');
+  if (outIdx < 0) {
+    return null;
+  }
+  const collected: string[] = [];
+  for (let i = outIdx + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (line === '' && lines[i + 1] === 'Conditions:') {
+      break;
+    }
+    if (/^[A-Z][A-Za-z ]+:$/.test(line) && !line.startsWith('  ')) {
+      break;
+    }
+    collected.push(line.startsWith('  ') ? line.slice(2) : line);
+  }
+  return collected.join('\n').trim() || null;
+}
+
+/**
  * Lightweight built-in linter for multi-document `ax.io/v1alpha1` YAML files so users
  * and agents receive immediate editor feedback even without external YAML extensions.
+ * Tracks multiline YAML block scalars (`|` / `>`) so inline scripts/files inside
+ * `Workspace.spec.setup.files[].content: |` never trigger false-positive diagnostics.
  */
 export function validateAxManifestText(text: string): ManifestDiagnostic[] {
   if (!text.includes('ax.io/v1alpha1')) {
@@ -264,6 +312,12 @@ export function validateAxManifestText(text: string): ManifestDiagnostic[] {
   let docKind: string | null = null;
   let inMetadata = false;
   let metadataIndent = -1;
+  let blockScalarParentIndent = -1;
+
+  let inSetup = false;
+  let setupIndent = -1;
+  let setupGitLine = -1;
+  let hasSetupGateway = false;
 
   const flushDoc = (endLine: number) => {
     if (inAxDoc && !docKind) {
@@ -273,15 +327,41 @@ export function validateAxManifestText(text: string): ManifestDiagnostic[] {
         message: 'AX manifest is missing required `kind` (Task, Workspace, Gateway, or Model).',
       });
     }
+    if (inAxDoc && docKind === 'Workspace' && setupGitLine >= 0 && !hasSetupGateway) {
+      diagnostics.push({
+        line: setupGitLine,
+        severity: 'warning',
+        message:
+          'Workspace `spec.setup.git` clones over HTTPS during pre-warming; set `spec.setup.gateway` so the setup actor has egress to the Git host.',
+      });
+    }
     inAxDoc = false;
     docKind = null;
     inMetadata = false;
     metadataIndent = -1;
+    blockScalarParentIndent = -1;
+    inSetup = false;
+    setupIndent = -1;
+    setupGitLine = -1;
+    hasSetupGateway = false;
     docStartLine = endLine;
   };
 
   for (let idx = 0; idx < lines.length; idx++) {
     const raw = lines[idx];
+    if (!raw.trim()) {
+      continue;
+    }
+    const indent = raw.search(/\S/);
+
+    // Skip lines inside a YAML literal/folded block scalar (`|` or `>`)
+    if (blockScalarParentIndent >= 0) {
+      if (indent > blockScalarParentIndent) {
+        continue;
+      }
+      blockScalarParentIndent = -1;
+    }
+
     const codeLine = raw.replace(/#.*$/, '');
     const trimmed = codeLine.trim();
     if (!trimmed) {
@@ -292,7 +372,11 @@ export function validateAxManifestText(text: string): ManifestDiagnostic[] {
       continue;
     }
 
-    const indent = raw.search(/\S/);
+    // Detect start of a YAML block scalar (`key: |`, `key: |-`, `key: >`, `- |`, etc.)
+    if (/:\s*[|>][-+]?\d*\s*$/.test(trimmed) || /^-\s+[|>][-+]?\d*\s*$/.test(trimmed)) {
+      blockScalarParentIndent = indent;
+      continue;
+    }
 
     const apiMatch = trimmed.match(/^apiVersion:\s*["']?([^"'\s]+)["']?$/);
     if (apiMatch && indent === 0) {
@@ -344,6 +428,25 @@ export function validateAxManifestText(text: string): ManifestDiagnostic[] {
       }
     }
 
+    if (docKind === 'Workspace') {
+      if (trimmed === 'setup:' && indent > 0) {
+        inSetup = true;
+        setupIndent = indent;
+        continue;
+      }
+      if (inSetup && indent <= setupIndent) {
+        inSetup = false;
+      }
+      if (inSetup) {
+        if (trimmed === 'git:' && setupGitLine < 0) {
+          setupGitLine = idx;
+        }
+        if (trimmed === 'gateway:' || trimmed.startsWith('gateway:')) {
+          hasSetupGateway = true;
+        }
+      }
+    }
+
     const imageMatch = trimmed.match(/^image:\s*["']?([^"'\s]+)["']?$/);
     if (imageMatch) {
       const img = imageMatch[1];
@@ -360,7 +463,8 @@ export function validateAxManifestText(text: string): ManifestDiagnostic[] {
       diagnostics.push({
         line: idx,
         severity: 'error',
-        message: 'Agent Substrate sizes sandboxes by `resources.limits` only; `resources.requests` is rejected by `ax apply`.',
+        message:
+          'Agent Substrate sizes sandboxes by `resources.limits` only; `resources.requests` is rejected by `ax apply`.',
       });
     }
   }
@@ -385,6 +489,15 @@ export class AxCli {
     }
     if (cfg.kubeconfig && cfg.kubeconfig.trim()) {
       env.KUBECONFIG = cfg.kubeconfig.trim();
+    }
+    if (cfg.serverImage?.trim()) {
+      env.AX_SERVER_IMAGE = cfg.serverImage.trim();
+    }
+    if (cfg.defaultTaskImage?.trim()) {
+      env.AX_DEFAULT_TASK_IMAGE = cfg.defaultTaskImage.trim();
+    }
+    if (cfg.runnerVolumeImage?.trim()) {
+      env.AX_RUNNER_VOLUME_IMAGE = cfg.runnerVolumeImage.trim();
     }
     return env;
   }
@@ -432,7 +545,11 @@ export class AxCli {
         if (!settled) {
           settled = true;
           child.kill('SIGTERM');
-          reject(new Error(`ax ${args.join(' ')} timed out after ${timeoutMs}ms`));
+          reject(
+            new Error(
+              `ax ${summarizeAxSubcommand(args)} timed out after ${Math.round(timeoutMs / 1000)}s`
+            )
+          );
         }
       }, timeoutMs);
 
@@ -475,7 +592,7 @@ export class AxCli {
     const res = await this.execRaw(args, options);
     if (res.exitCode !== 0) {
       const detail = (res.stderr || res.stdout || `exit code ${res.exitCode}`).trim();
-      throw new Error(`ax ${args[0] || ''} failed: ${detail}`);
+      throw new Error(`ax ${summarizeAxSubcommand(args)} failed: ${detail}`);
     }
     return res.stdout;
   }
@@ -549,6 +666,7 @@ export class AxCli {
 
   public async applyFile(filePath: string, atespace?: string): Promise<string> {
     // Only pass -a if explicitly overridden so manifest-level metadata.atespace is respected.
+    // Allow 5 minutes because Workspace pre-warming clones git repos & uploads snapshots synchronously.
     const cfg = this.getConfig();
     const args: string[] = [];
     if (atespace?.trim()) {
@@ -564,7 +682,7 @@ export class AxCli {
       args.push('--server', cfg.server.trim());
     }
     args.push('apply', '-f', filePath);
-    const out = await this.execChecked(args, { timeoutMs: 45_000 });
+    const out = await this.execChecked(args, { timeoutMs: 300_000 });
     return out.trim();
   }
 
@@ -584,13 +702,13 @@ export class AxCli {
       args.push('--server', cfg.server.trim());
     }
     args.push('apply', '-f', '-');
-    const out = await this.execChecked(args, { stdin: manifestYaml, timeoutMs: 45_000 });
+    const out = await this.execChecked(args, { stdin: manifestYaml, timeoutMs: 300_000 });
     return out.trim();
   }
 
   public async resumeTask(name: string, atespace?: string): Promise<string> {
     const args = [...this.buildGlobalFlags({ atespace }), 'resume', 'task', name];
-    const out = await this.execChecked(args, { timeoutMs: 180_000 });
+    const out = await this.execChecked(args, { timeoutMs: 240_000 });
     return out.trim();
   }
 
@@ -616,6 +734,12 @@ export class AxCli {
   ): Promise<string> {
     const args = [...this.buildGlobalFlags({ atespace }), 'get', kind, name];
     return await this.execChecked(args, { timeoutMs: 25_000 });
+  }
+
+  public async getTaskOutput(name: string, atespace?: string): Promise<string> {
+    const desc = await this.describeResource('task', name, atespace);
+    const extracted = extractDescribeOutputSection(desc);
+    return extracted ?? desc;
   }
 
   public async deleteResource(

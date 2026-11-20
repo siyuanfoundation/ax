@@ -32,7 +32,12 @@ export interface InstallResult {
   syncedSkillDirs: string[];
 }
 
-export const AGENT_SKILL_ROOTS = ['.agents', '.claude', '.gemini'] as const;
+export const AGENT_SKILL_ROOTS = [
+  '.agents',
+  '.claude',
+  '.gemini',
+  '.gemini/config',
+] as const;
 
 export function resolveInstallDir(explicitDir?: string, homeDir: string = os.homedir()): string {
   const trimmed = (explicitDir || process.env.AX_INSTALL_DIR || '').trim();
@@ -54,9 +59,6 @@ export function resolveBundledAxBinary(
   const candidates = [
     path.join(extensionPath, 'bin', `ax-${platform}-${arch}`),
     path.join(extensionPath, 'bin', 'ax'),
-    // Fallback for local monorepo checkouts where `make build` wrote `../bin/ax`
-    path.resolve(extensionPath, '..', 'bin', 'ax'),
-    path.resolve(extensionPath, '..', '.tmp', 'bin', 'ax'),
   ];
   for (const candidate of candidates) {
     if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
@@ -147,10 +149,17 @@ export function installAxCliAndSkills(options: InstallOptions): InstallResult {
   if (fs.existsSync(bundledSkillMd)) {
     for (const rootName of AGENT_SKILL_ROOTS) {
       const rootDir = path.join(homeDir, rootName);
-      // Respect symlinked skill directories inside project checkouts if homeDir happens to have symlinks,
-      // and write cleanly into user global skill roots.
       try {
-        const dstSkillDir = path.join(rootDir, 'skills', 'ax');
+        const skillsParent = path.join(rootDir, 'skills');
+        if (fs.existsSync(skillsParent) && fs.lstatSync(skillsParent).isFile()) {
+          const raw = fs.readFileSync(skillsParent, 'utf8').trim();
+          const jsonDest = `${skillsParent}.json`;
+          if (raw.startsWith('{') && !fs.existsSync(jsonDest)) {
+            fs.renameSync(skillsParent, jsonDest);
+            log(`Migrated misplaced JSON config file ${skillsParent} -> ${jsonDest}`);
+          }
+        }
+        const dstSkillDir = path.join(skillsParent, 'ax');
         copyDirectoryRecursive(bundledSkillDir, dstSkillDir);
         syncedSkillDirs.push(dstSkillDir);
       } catch (err) {
